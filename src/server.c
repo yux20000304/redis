@@ -13,6 +13,7 @@
  */
 
 #include "server.h"
+#include "cxl_ring.h"
 #include "monotonic.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
@@ -1896,6 +1897,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* If any connection type(typical TLS) still has pending unread data don't sleep at all. */
     int dont_sleep = connTypeHasPendingData(server.el);
+
+    /* Poll shared-memory ring if enabled (ingest requests / flush replies). */
+    cxlRingBeforeSleep();
 
     /* Call the Redis Cluster before sleep function. Note that this function
      * may change the state of Redis Cluster (from ok to fail or vice versa),
@@ -7802,6 +7806,10 @@ int main(int argc, char **argv) {
     }
 
     initServer();
+    /* Optional: enable CXL ring if env provides path. */
+    if (cxlRingInitFromEnv() != C_OK) {
+        serverLog(LL_NOTICE, "CXL ring disabled (set CXL_RING_PATH to enable).");
+    }
     if (background || server.pidfile) createPidFile();
     if (server.set_proc_title) redisSetProcTitle(NULL);
     redisAsciiArt();
