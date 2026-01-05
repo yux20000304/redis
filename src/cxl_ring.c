@@ -194,6 +194,39 @@ static int init_layout(size_t map_size) {
 
     int header_ok = (memcmp(p, CXL_MAGIC, 8) == 0) && (ver == CXL_VERSION) &&
                     (ring_count >= 1 && ring_count <= MAX_RINGS);
+
+    /* Validate existing layout against current mapping size.
+     *
+     * The shared-memory header persists across runs. If Redis re-attaches with
+     * a smaller mapping (e.g., CXL_RING_MAP_SIZE reduced), the stored offsets
+     * may point beyond the current mapping and cause a crash. In this case,
+     * treat the header as invalid and reinitialize it for the current map_size.
+     */
+    if (header_ok) {
+        if (g_ctx.ring_count > 0 && ring_count != (uint32_t)g_ctx.ring_count) {
+            header_ok = 0;
+        } else {
+            size_t header_size = 16 + (size_t)ring_count * sizeof(uint64_t) * 4;
+            size_t header_aligned = align_up(header_size, 4096);
+            if (header_aligned > map_size) header_ok = 0;
+            for (uint32_t i = 0; header_ok && i < ring_count; i++) {
+                uint64_t req_off = 0, req_sz = 0, resp_off = 0, resp_sz = 0;
+                memcpy(&req_off, p + 24 + i * 32, sizeof(uint64_t));
+                memcpy(&req_sz, p + 32 + i * 32, sizeof(uint64_t));
+                memcpy(&resp_off, p + 40 + i * 32, sizeof(uint64_t));
+                memcpy(&resp_sz, p + 48 + i * 32, sizeof(uint64_t));
+
+                if (req_off < header_aligned || resp_off < header_aligned) header_ok = 0;
+                if ((req_off % 4096) || (resp_off % 4096)) header_ok = 0;
+                if ((req_sz % 4096) || (resp_sz % 4096)) header_ok = 0;
+                if (req_sz < 16 + DEFAULT_SLOT_SIZE) header_ok = 0;
+                if (resp_sz < 16 + DEFAULT_SLOT_SIZE) header_ok = 0;
+                if (req_off + req_sz > map_size) header_ok = 0;
+                if (resp_off + resp_sz > map_size) header_ok = 0;
+                if (resp_off < req_off + req_sz) header_ok = 0;
+            }
+        }
+    }
     if (!header_ok) {
         ring_count = g_ctx.ring_count > 0 ? g_ctx.ring_count : DEFAULT_RING_COUNT;
         if (ring_count > MAX_RINGS) ring_count = MAX_RINGS;
