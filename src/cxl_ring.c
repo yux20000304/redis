@@ -267,15 +267,24 @@ static int sec_request_access(uint64_t off, uint32_t len) {
     req.offset_be = htobe64(off);
     req.length_be = htonl(len);
 
-    if (write_full(g_ctx.sec_fd, &req, sizeof(req)) != 0) return -1;
+    if (write_full(g_ctx.sec_fd, &req, sizeof(req)) != 0) {
+        serverLog(LL_WARNING, "cxl sec: write access req failed: %s", strerror(errno));
+        return -1;
+    }
     struct sec_resp resp;
     ssize_t r = read_full(g_ctx.sec_fd, &resp, sizeof(resp));
-    if (r != (ssize_t)sizeof(resp)) return -1;
+    if (r != (ssize_t)sizeof(resp)) {
+        serverLog(LL_WARNING, "cxl sec: read access resp failed (read=%zd): %s", r, (r < 0) ? strerror(errno) : "short read");
+        return -1;
+    }
 
     uint32_t magic = ntohl(resp.magic_be);
     uint16_t ver = ntohs(resp.version_be);
     uint16_t status = ntohs(resp.status_be);
-    if (magic != SEC_PROTO_MAGIC || ver != SEC_PROTO_VERSION || status != SEC_STATUS_OK) return -1;
+    if (magic != SEC_PROTO_MAGIC || ver != SEC_PROTO_VERSION || status != SEC_STATUS_OK) {
+        serverLog(LL_WARNING, "cxl sec: access denied/bad resp (magic=0x%x ver=%u status=%u)", magic, ver, status);
+        return -1;
+    }
     return 0;
 }
 
@@ -604,6 +613,8 @@ int cxlRingInitFromEnv(void) {
         const char *nid = getenv("CXL_SEC_NODE_ID");
         if (nid) node_id = (uint32_t)strtoul(nid, NULL, 0);
 
+        serverLog(LL_NOTICE, "cxl sec: enabling (mgr=%s node_id=%u timeout_ms=%u)", mgr, node_id, timeout_ms);
+
         if (sodium_init() < 0) {
             serverLog(LL_WARNING, "cxl sec: sodium_init failed");
             munmap(g_ctx.mm, g_ctx.map_size);
@@ -613,13 +624,15 @@ int cxlRingInitFromEnv(void) {
         g_ctx.sec_enabled = 1;
         g_ctx.sec_node_id = node_id;
         g_ctx.sec_principal = ((uint64_t)node_id << 32) | (uint32_t)getpid();
-        g_ctx.sec_fd = sec_connect_mgr(mgr);
-        if (g_ctx.sec_fd < 0) {
-            serverLog(LL_WARNING, "cxl sec: connect failed (mgr=%s)", mgr);
+        int fd = sec_connect_mgr(mgr);
+        if (fd < 0) {
+            int err = errno;
+            serverLog(LL_WARNING, "cxl sec: connect failed (mgr=%s): %s", mgr, strerror(err));
             munmap(g_ctx.mm, g_ctx.map_size);
             close(g_ctx.fd);
             return C_ERR;
         }
+        g_ctx.sec_fd = fd;
         if (sec_wait_table_ready(timeout_ms) != 0) {
             serverLog(LL_WARNING, "cxl sec: timeout waiting for table (offset=%u)", (unsigned)CXL_SEC_TABLE_OFF);
             close(g_ctx.sec_fd);

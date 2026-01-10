@@ -7807,7 +7807,12 @@ int main(int argc, char **argv) {
 
     initServer();
     /* Optional: enable CXL ring if env provides path. */
-    if (cxlRingInitFromEnv() != C_OK) {
+    const char *cxl_path = getenv("CXL_RING_PATH");
+    if (cxl_path && cxl_path[0]) {
+        if (cxlRingInitFromEnv() != C_OK) {
+            serverLog(LL_WARNING, "CXL ring init failed; continuing without ring.");
+        }
+    } else {
         serverLog(LL_NOTICE, "CXL ring disabled (set CXL_RING_PATH to enable).");
     }
     if (background || server.pidfile) createPidFile();
