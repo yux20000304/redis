@@ -112,6 +112,8 @@ typedef struct {
     size_t map_size;
     size_t file_size;
     unsigned char *mm;
+    uint64_t shm_delay_ns;
+    uint64_t shm_pause_iters_per_ns_x1024;
     CxlRing req[MAX_RINGS];
     CxlRing resp[MAX_RINGS];
     int ring_count;
@@ -129,6 +131,36 @@ static int cxlRingCron(aeEventLoop *eventLoop, long long id, void *clientData);
 
 static inline size_t align_up(size_t x, size_t a) {
     return (x + a - 1) / a * a;
+}
+
+static inline uint64_t nowns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void cxl_shm_delay_calibrate(void) {
+    if (g_ctx.shm_pause_iters_per_ns_x1024) return;
+    const uint64_t iters = 5000000ULL;
+    uint64_t start = nowns();
+    for (uint64_t i = 0; i < iters; i++) {
+        __asm__ __volatile__("pause");
+    }
+    uint64_t dt = nowns() - start;
+    if (dt == 0) dt = 1;
+    g_ctx.shm_pause_iters_per_ns_x1024 = (iters * 1024ULL) / dt;
+    if (g_ctx.shm_pause_iters_per_ns_x1024 == 0) g_ctx.shm_pause_iters_per_ns_x1024 = 1;
+}
+
+static inline void cxl_shm_delay(void) {
+    uint64_t ns = g_ctx.shm_delay_ns;
+    if (!ns) return;
+    if (!g_ctx.shm_pause_iters_per_ns_x1024) cxl_shm_delay_calibrate();
+    uint64_t iters = (ns * g_ctx.shm_pause_iters_per_ns_x1024 + 1023ULL) / 1024ULL;
+    if (iters == 0) iters = 1;
+    for (uint64_t i = 0; i < iters; i++) {
+        __asm__ __volatile__("pause");
+    }
 }
 
 static int parse_hostport(const char *s, char **host_out, char **port_out) {
@@ -320,6 +352,7 @@ static void ring_setup(CxlRing *r, unsigned char *base, const CxlRingConfig *cfg
 
 static int ring_push(CxlRing *r, int ring_idx, uint8_t direction, uint32_t client_id, uint16_t msg_type,
                      const unsigned char *payload, uint32_t len) {
+    cxl_shm_delay();
     uint64_t head = *r->head;
     uint64_t tail = *r->tail;
     if (head - tail >= r->cfg.slots) return 0; /* full */
@@ -351,6 +384,7 @@ static int ring_push(CxlRing *r, int ring_idx, uint8_t direction, uint32_t clien
 
 static int ring_pop(CxlRing *r, int ring_idx, uint8_t direction, uint32_t *client_id, uint16_t *msg_type,
                     unsigned char **payload, uint32_t *len) {
+    cxl_shm_delay();
     uint64_t head = *r->head;
     uint64_t tail = *r->tail;
     if (tail == head) return 0; /* empty */
@@ -567,6 +601,14 @@ int cxlRingInitFromEnv(void) {
         if (v > 0) map_size = (size_t)v;
     }
 
+    g_ctx.shm_delay_ns = 0;
+    const char *delay_ns = getenv("CXL_SHM_DELAY_NS");
+    if (delay_ns && delay_ns[0]) {
+        errno = 0;
+        unsigned long long v = strtoull(delay_ns, NULL, 0);
+        if (errno == 0) g_ctx.shm_delay_ns = (uint64_t)v;
+    }
+
     g_ctx.sec_enabled = 0;
     g_ctx.sec_fd = -1;
 
@@ -659,6 +701,10 @@ int cxlRingInitFromEnv(void) {
     }
     serverLog(LL_NOTICE, "cxl ring: enabled path=%s map_size=%zu rings=%d slots_per_ring=%u",
               path, g_ctx.map_size, g_ctx.ring_count, g_ctx.req[0].cfg.slots);
+    if (g_ctx.shm_delay_ns) {
+        serverLog(LL_NOTICE, "cxl ring: simulated shm delay enabled (CXL_SHM_DELAY_NS=%llu)",
+                  (unsigned long long)g_ctx.shm_delay_ns);
+    }
     return C_OK;
 }
 
