@@ -79,12 +79,13 @@ struct sec_resp {
 };
 
 /* Simple binary protocol (no RESP):
- * Request: u8 op (1=GET,2=SET), u8 key_len, u16 val_len (LE), key, val
+ * Request: u8 op (1=GET,2=SET,3=DEL), u8 key_len, u16 val_len (LE), key, val
  * Response: u8 status (0=OK,1=MISS,2=ERR), u16 val_len (LE), val (for GET hit)
  */
 enum {
     CXL_OP_GET = 1,
-    CXL_OP_SET = 2
+    CXL_OP_SET = 2,
+    CXL_OP_DEL = 3
 };
 enum {
     CXL_STATUS_OK = 0,
@@ -110,7 +111,6 @@ typedef struct {
     int enabled;
     int fd;
     size_t map_size;
-    size_t map_offset;
     size_t file_size;
     unsigned char *mm;
     uint64_t shm_delay_ns;
@@ -475,6 +475,18 @@ static void handle_request(int ring_idx, uint32_t cid, uint16_t msg_type, unsign
         server.dirty++;
         send_binary_resp(ring_idx, &g_ctx.resp[ring_idx], cid, CXL_STATUS_OK, NULL, 0);
         decrRefCount(keyobj);
+    } else if (op == CXL_OP_DEL) {
+        robj *keyobj = createRawStringObject((const char *)key, key_len);
+        int deleted = dbDelete(db, keyobj);
+        if (deleted) {
+            signalModifiedKey(NULL, db, keyobj);
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyobj, db->id);
+            server.dirty++;
+            send_binary_resp(ring_idx, &g_ctx.resp[ring_idx], cid, CXL_STATUS_OK, NULL, 0);
+        } else {
+            send_binary_resp(ring_idx, &g_ctx.resp[ring_idx], cid, CXL_STATUS_MISS, NULL, 0);
+        }
+        decrRefCount(keyobj);
     } else {
         send_binary_resp(ring_idx, &g_ctx.resp[ring_idx], cid, CXL_STATUS_ERR, NULL, 0);
     }
@@ -589,7 +601,6 @@ int cxlRingInitFromEnv(void) {
     const char *path = getenv("CXL_RING_PATH");
     if (!path) return C_ERR;
     size_t map_size = DEFAULT_MAP_SIZE;
-    size_t map_offset = 0;
     int ring_count = DEFAULT_RING_COUNT;
     const char *rc = getenv("CXL_RING_COUNT");
     if (rc) {
@@ -601,12 +612,6 @@ int cxlRingInitFromEnv(void) {
     if (ms) {
         unsigned long long v = strtoull(ms, NULL, 0);
         if (v > 0) map_size = (size_t)v;
-    }
-    const char *mo = getenv("CXL_RING_OFFSET");
-    if (!mo || !mo[0]) mo = getenv("CXL_SHM_OFFSET");
-    if (mo && mo[0]) {
-        unsigned long long v = strtoull(mo, NULL, 0);
-        if (v > 0) map_offset = (size_t)v;
     }
 
     g_ctx.shm_delay_ns = 0;
@@ -633,25 +638,8 @@ int cxlRingInitFromEnv(void) {
     }
     g_ctx.file_size = st.st_size;
     g_ctx.map_size = map_size ? map_size : st.st_size;
-    g_ctx.map_offset = map_offset;
-    long page = sysconf(_SC_PAGESIZE);
-    if (page > 0 && (g_ctx.map_offset % (size_t)page) != 0) {
-        serverLog(LL_WARNING, "cxl ring: CXL_RING_OFFSET=%zu is not page-aligned", g_ctx.map_offset);
-        close(g_ctx.fd);
-        return C_ERR;
-    }
-    if (S_ISREG(st.st_mode)) {
-        if ((size_t)st.st_size <= g_ctx.map_offset) {
-            serverLog(LL_WARNING, "cxl ring: map offset (%zu) exceeds file size (%zu)",
-                      g_ctx.map_offset, (size_t)st.st_size);
-            close(g_ctx.fd);
-            return C_ERR;
-        }
-        if (g_ctx.map_size > (size_t)st.st_size - g_ctx.map_offset) {
-            g_ctx.map_size = (size_t)st.st_size - g_ctx.map_offset;
-        }
-    }
-    g_ctx.mm = mmap(NULL, g_ctx.map_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_ctx.fd, (off_t)g_ctx.map_offset);
+    if (g_ctx.map_size > (size_t)st.st_size) g_ctx.map_size = st.st_size;
+    g_ctx.mm = mmap(NULL, g_ctx.map_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_ctx.fd, 0);
     if (g_ctx.mm == MAP_FAILED) {
         serverLog(LL_WARNING, "cxl ring: mmap failed: %s", strerror(errno));
         close(g_ctx.fd);
@@ -724,8 +712,8 @@ int cxlRingInitFromEnv(void) {
             g_ctx.timer_id = 0;
         }
     }
-    serverLog(LL_NOTICE, "cxl ring: enabled path=%s map_size=%zu map_offset=%zu rings=%d slots_per_ring=%u",
-              path, g_ctx.map_size, g_ctx.map_offset, g_ctx.ring_count, g_ctx.req[0].cfg.slots);
+    serverLog(LL_NOTICE, "cxl ring: enabled path=%s map_size=%zu rings=%d slots_per_ring=%u",
+              path, g_ctx.map_size, g_ctx.ring_count, g_ctx.req[0].cfg.slots);
     if (g_ctx.shm_delay_ns) {
         serverLog(LL_NOTICE, "cxl ring: simulated shm delay enabled (CXL_SHM_DELAY_NS=%llu)",
                   (unsigned long long)g_ctx.shm_delay_ns);
