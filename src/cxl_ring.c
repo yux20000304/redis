@@ -20,14 +20,20 @@
 
 #include "../../tdx_shm/tdx_shm_transport.h"
 
+#include <arpa/inet.h>
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <netdb.h>
+#include <sodium.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -41,6 +47,58 @@
 
 #define RING_SLOT_HDR_SIZE 16U
 #define RING_MAX_PAYLOAD ((uint32_t)TDX_SHM_MSG_MAX - RING_SLOT_HDR_SIZE)
+
+/* Shared-memory security table (cxl_sec_mgr). */
+#define CXL_SEC_TABLE_OFF 512
+#define CXL_SEC_MAGIC "CXLSEC1\0"
+#define CXL_SEC_VERSION 1
+#define CXL_SEC_MAX_ENTRIES (MAX_RINGS * 2)
+#define CXL_SEC_MAX_PRINCIPALS 16
+
+#define SEC_PROTO_MAGIC 0x43534543u /* 'CSEC' */
+#define SEC_PROTO_VERSION 1
+#define SEC_REQ_ACCESS 1
+
+#define SEC_STATUS_OK 0
+
+/* ring_slot_hdr.flags */
+#define RING_FLAG_SECURE 0x0001u
+
+#define SEC_DIR_REQ 1u  /* client->server */
+#define SEC_DIR_RESP 2u /* server->client */
+
+typedef struct {
+    uint64_t start_off;
+    uint64_t end_off;
+    unsigned char key[crypto_stream_chacha20_ietf_KEYBYTES];
+    uint32_t principal_count;
+    uint32_t reserved;
+    uint64_t principals[CXL_SEC_MAX_PRINCIPALS];
+} CxlSecEntry;
+
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t entry_count;
+    CxlSecEntry entries[CXL_SEC_MAX_ENTRIES];
+} CxlSecTable;
+
+struct sec_req {
+    uint32_t magic_be;
+    uint16_t version_be;
+    uint16_t type_be;
+    uint64_t principal_be;
+    uint64_t offset_be;
+    uint32_t length_be;
+    uint32_t reserved_be;
+};
+
+struct sec_resp {
+    uint32_t magic_be;
+    uint16_t version_be;
+    uint16_t status_be;
+    uint32_t reserved_be;
+};
 
 enum {
     CXL_OP_GET = 1,
@@ -80,6 +138,14 @@ typedef struct {
 
     long long timer_id;
     unsigned long long req_seen[MAX_RINGS];
+
+    int secure_enabled;
+    uint64_t sec_node_id;
+    unsigned sec_timeout_ms;
+    char sec_mgr[256];
+    unsigned char sec_key[MAX_RINGS][crypto_aead_chacha20poly1305_ietf_KEYBYTES];
+    int sec_key_ok[MAX_RINGS];
+    atomic_uint_fast64_t sec_nonce_ctr_resp[MAX_RINGS];
 } CxlRingCtx;
 
 static CxlRingCtx g_ctx = {0};
@@ -161,6 +227,357 @@ static size_t env_size(const char *key, size_t def) {
     return out;
 }
 
+static int env_enabled(const char *key) {
+    const char *v = getenv(key);
+    if (!v || !v[0]) return 0;
+    if (!strcmp(v, "0") || !strcasecmp(v, "false") || !strcasecmp(v, "no")) return 0;
+    return 1;
+}
+
+static int parse_hostport(const char *s, char **host_out, char **port_out) {
+    const char *colon = strrchr(s, ':');
+    if (!colon || colon == s || *(colon + 1) == '\0') return -1;
+    size_t host_len = (size_t)(colon - s);
+    char *host = (char *)zcalloc(host_len + 1);
+    char *port = zstrdup(colon + 1);
+    if (!host || !port) {
+        zfree(host);
+        zfree(port);
+        return -1;
+    }
+    memcpy(host, s, host_len);
+    host[host_len] = '\0';
+    *host_out = host;
+    *port_out = port;
+    return 0;
+}
+
+static ssize_t read_full(int fd, void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, (unsigned char *)buf + off, n - off);
+        if (r == 0) return (ssize_t)off;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)r;
+    }
+    return (ssize_t)off;
+}
+
+static int write_full(int fd, const void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, (const unsigned char *)buf + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+static int socket_connect(const char *host, const char *port) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *res = NULL;
+    int rc = getaddrinfo(host, port, &hints, &res);
+    if (rc != 0) {
+        serverLog(LL_WARNING, "cxl_sec: getaddrinfo(connect %s:%s): %s", host, port, gai_strerror(rc));
+        return -1;
+    }
+
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(res);
+    return fd;
+}
+
+static void sleep_ms(unsigned ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000U;
+    ts.tv_nsec = (long)(ms % 1000U) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+}
+
+static int sec_table_ready(const CxlSecTable *t) {
+    if (!t) return 0;
+    if (memcmp(t->magic, CXL_SEC_MAGIC, 8) != 0) return 0;
+    if (t->version != CXL_SEC_VERSION) return 0;
+    if (t->entry_count == 0 || t->entry_count > CXL_SEC_MAX_ENTRIES) return 0;
+    return 1;
+}
+
+static int sec_table_find(const CxlSecTable *t, uint64_t off, uint64_t len, uint32_t *idx_out) {
+    if (!t || !idx_out || !sec_table_ready(t)) return -1;
+    if (len == 0) return -1;
+    uint64_t end = off + len;
+    if (end < off) return -1;
+    uint32_t n = t->entry_count;
+    if (n > CXL_SEC_MAX_ENTRIES) n = CXL_SEC_MAX_ENTRIES;
+    for (uint32_t i = 0; i < n; i++) {
+        const CxlSecEntry *e = &t->entries[i];
+        if (off >= e->start_off && end <= e->end_off) {
+            *idx_out = i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int sec_entry_has_principal(const CxlSecEntry *e, uint64_t principal) {
+    if (!e) return 0;
+    uint32_t n = e->principal_count;
+    if (n > CXL_SEC_MAX_PRINCIPALS) n = CXL_SEC_MAX_PRINCIPALS;
+    for (uint32_t i = 0; i < n; i++) {
+        if (e->principals[i] == principal) return 1;
+    }
+    return 0;
+}
+
+static int sec_mgr_request_access(const char *mgr, uint64_t principal, uint64_t off, uint32_t len) {
+    char *host = NULL, *port = NULL;
+    if (parse_hostport(mgr, &host, &port) != 0) return -1;
+
+    int fd = socket_connect(host, port);
+    if (fd < 0) {
+        zfree(host);
+        zfree(port);
+        return -1;
+    }
+
+    struct sec_req req;
+    memset(&req, 0, sizeof(req));
+    req.magic_be = htonl(SEC_PROTO_MAGIC);
+    req.version_be = htons(SEC_PROTO_VERSION);
+    req.type_be = htons(SEC_REQ_ACCESS);
+    req.principal_be = htobe64(principal);
+    req.offset_be = htobe64(off);
+    req.length_be = htonl(len);
+
+    int rc = -1;
+    if (write_full(fd, &req, sizeof(req)) != 0) goto out;
+    struct sec_resp resp;
+    ssize_t r = read_full(fd, &resp, sizeof(resp));
+    if (r != (ssize_t)sizeof(resp)) goto out;
+
+    uint32_t magic = ntohl(resp.magic_be);
+    uint16_t ver = ntohs(resp.version_be);
+    uint16_t status = ntohs(resp.status_be);
+    if (magic != SEC_PROTO_MAGIC || ver != SEC_PROTO_VERSION) goto out;
+    if (status != SEC_STATUS_OK) goto out;
+    rc = 0;
+out:
+    close(fd);
+    zfree(host);
+    zfree(port);
+    return rc;
+}
+
+static int cxl_sec_init(void) {
+    g_ctx.secure_enabled = env_enabled("CXL_SEC_ENABLE");
+    if (!g_ctx.secure_enabled) return C_OK;
+
+    if (sodium_init() < 0) {
+        serverLog(LL_WARNING, "cxl_sec: sodium_init failed");
+        return C_ERR;
+    }
+
+    const char *mgr = getenv("CXL_SEC_MGR");
+    if (!mgr || !mgr[0]) {
+        serverLog(LL_WARNING, "cxl_sec: CXL_SEC_ENABLE=1 requires CXL_SEC_MGR=ip:port");
+        return C_ERR;
+    }
+    snprintf(g_ctx.sec_mgr, sizeof(g_ctx.sec_mgr), "%s", mgr);
+
+    const char *id_env = getenv("CXL_SEC_NODE_ID");
+    if (!id_env || !id_env[0]) {
+        serverLog(LL_WARNING, "cxl_sec: CXL_SEC_ENABLE=1 requires CXL_SEC_NODE_ID");
+        return C_ERR;
+    }
+    g_ctx.sec_node_id = strtoull(id_env, NULL, 0);
+    if (g_ctx.sec_node_id == 0) {
+        serverLog(LL_WARNING, "cxl_sec: invalid CXL_SEC_NODE_ID=%s", id_env);
+        return C_ERR;
+    }
+
+    g_ctx.sec_timeout_ms = 10000;
+    const char *to_env = getenv("CXL_SEC_TIMEOUT_MS");
+    if (to_env && to_env[0]) {
+        g_ctx.sec_timeout_ms = (unsigned)strtoul(to_env, NULL, 0);
+    }
+
+    if (g_ctx.region_base < 4096) {
+        serverLog(LL_WARNING, "cxl_sec: secure mode requires CXL_RING_REGION_BASE >= 4096");
+        return C_ERR;
+    }
+    if (g_ctx.map_size < CXL_SEC_TABLE_OFF + sizeof(CxlSecTable)) {
+        serverLog(LL_WARNING, "cxl_sec: mapping too small for CXLSEC table");
+        return C_ERR;
+    }
+
+    const CxlSecTable *t = (const CxlSecTable *)(g_ctx.mm + CXL_SEC_TABLE_OFF);
+    unsigned waited = 0;
+    while (1) {
+        if (sec_table_ready(t)) break;
+        if (waited >= g_ctx.sec_timeout_ms) break;
+        sleep_ms(10);
+        waited += 10;
+    }
+    if (!sec_table_ready(t)) {
+        serverLog(LL_WARNING, "cxl_sec: timeout waiting for CXLSEC table");
+        return C_ERR;
+    }
+
+    for (int i = 0; i < g_ctx.ring_count; i++) {
+        uint64_t off = (uint64_t)g_ctx.region_base + (uint64_t)i * (uint64_t)g_ctx.region_size;
+        uint32_t idx = 0;
+        if (sec_table_find(t, off, 1, &idx) != 0) {
+            serverLog(LL_WARNING, "cxl_sec: no table entry for ring=%d off=%llu", i, (unsigned long long)off);
+            return C_ERR;
+        }
+
+        unsigned waited2 = 0;
+        while (1) {
+            if (sec_entry_has_principal(&t->entries[idx], g_ctx.sec_node_id)) break;
+            (void)sec_mgr_request_access(g_ctx.sec_mgr, g_ctx.sec_node_id, off, 1);
+            if (waited2 >= g_ctx.sec_timeout_ms) break;
+            sleep_ms(10);
+            waited2 += 10;
+        }
+        if (!sec_entry_has_principal(&t->entries[idx], g_ctx.sec_node_id)) {
+            serverLog(LL_WARNING, "cxl_sec: principal %llu not granted for ring=%d",
+                      (unsigned long long)g_ctx.sec_node_id, i);
+            return C_ERR;
+        }
+
+        memcpy(g_ctx.sec_key[i], t->entries[idx].key, crypto_aead_chacha20poly1305_ietf_KEYBYTES);
+        g_ctx.sec_key_ok[i] = 1;
+        atomic_store_explicit(&g_ctx.sec_nonce_ctr_resp[i], 0, memory_order_relaxed);
+    }
+
+    serverLog(LL_NOTICE, "cxl_sec: enabled (node_id=%llu mgr=%s)", (unsigned long long)g_ctx.sec_node_id, g_ctx.sec_mgr);
+    return C_OK;
+}
+
+static int sec_encrypt(uint32_t ring_idx,
+                       uint32_t cid,
+                       uint16_t type,
+                       uint16_t flags,
+                       const unsigned char *payload,
+                       uint32_t payload_len,
+                       unsigned dir,
+                       unsigned char *out,
+                       uint32_t out_cap,
+                       uint32_t *out_len) {
+    if (!out || !out_len || !payload) return C_ERR;
+    if (!g_ctx.secure_enabled) return C_ERR;
+    if (ring_idx >= (uint32_t)g_ctx.ring_count || ring_idx >= MAX_RINGS) return C_ERR;
+    if (!g_ctx.sec_key_ok[ring_idx]) return C_ERR;
+
+    const uint32_t nonce_bytes = crypto_aead_chacha20poly1305_ietf_NPUBBYTES;
+    const uint32_t tag_bytes = crypto_aead_chacha20poly1305_ietf_ABYTES;
+    if (payload_len > RING_MAX_PAYLOAD) return C_ERR;
+    if (payload_len > RING_MAX_PAYLOAD - nonce_bytes - tag_bytes) return C_ERR;
+
+    uint32_t clen_total = nonce_bytes + payload_len + tag_bytes;
+    if (clen_total > out_cap) return C_ERR;
+
+    struct ring_slot_hdr hdr;
+    hdr.cid = cid;
+    hdr.type = type;
+    hdr.flags = flags;
+    hdr.len = clen_total;
+    hdr.reserved = 0;
+
+    unsigned char nonce[crypto_aead_chacha20poly1305_ietf_NPUBBYTES];
+    memset(nonce, 0, sizeof(nonce));
+    nonce[0] = (unsigned char)(dir & 0xffu);
+    nonce[1] = (unsigned char)(ring_idx & 0xffu);
+    uint64_t ctr = atomic_fetch_add_explicit(&g_ctx.sec_nonce_ctr_resp[ring_idx], 1, memory_order_relaxed);
+    for (int i = 0; i < 8; i++) {
+        nonce[4 + i] = (unsigned char)((ctr >> (8 * i)) & 0xffu);
+    }
+
+    memcpy(out, nonce, nonce_bytes);
+    unsigned long long cbytes = 0;
+    if (crypto_aead_chacha20poly1305_ietf_encrypt(out + nonce_bytes,
+                                                  &cbytes,
+                                                  payload,
+                                                  (unsigned long long)payload_len,
+                                                  (const unsigned char *)&hdr,
+                                                  (unsigned long long)sizeof(hdr),
+                                                  NULL,
+                                                  nonce,
+                                                  g_ctx.sec_key[ring_idx]) != 0) {
+        return C_ERR;
+    }
+    if (cbytes != (unsigned long long)(payload_len + tag_bytes)) return C_ERR;
+    *out_len = (uint32_t)(nonce_bytes + (uint32_t)cbytes);
+    return C_OK;
+}
+
+static int sec_decrypt(uint32_t ring_idx,
+                       uint32_t cid,
+                       uint16_t type,
+                       uint16_t flags,
+                       const unsigned char *payload,
+                       uint32_t payload_len,
+                       unsigned char *out,
+                       uint32_t out_cap,
+                       uint32_t *out_len) {
+    if (!out || !out_len || !payload) return C_ERR;
+    if (!g_ctx.secure_enabled) return C_ERR;
+    if (ring_idx >= (uint32_t)g_ctx.ring_count || ring_idx >= MAX_RINGS) return C_ERR;
+    if (!g_ctx.sec_key_ok[ring_idx]) return C_ERR;
+
+    const uint32_t nonce_bytes = crypto_aead_chacha20poly1305_ietf_NPUBBYTES;
+    const uint32_t tag_bytes = crypto_aead_chacha20poly1305_ietf_ABYTES;
+    if (payload_len < nonce_bytes + tag_bytes) return C_ERR;
+    uint32_t clen = payload_len - nonce_bytes;
+    if (clen < tag_bytes) return C_ERR;
+    uint32_t pmax = clen - tag_bytes;
+    if (pmax > out_cap) return C_ERR;
+
+    struct ring_slot_hdr hdr;
+    hdr.cid = cid;
+    hdr.type = type;
+    hdr.flags = flags;
+    hdr.len = payload_len;
+    hdr.reserved = 0;
+
+    const unsigned char *nonce = payload;
+    const unsigned char *cipher = payload + nonce_bytes;
+    unsigned long long pbytes = 0;
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(out,
+                                                  &pbytes,
+                                                  NULL,
+                                                  cipher,
+                                                  (unsigned long long)clen,
+                                                  (const unsigned char *)&hdr,
+                                                  (unsigned long long)sizeof(hdr),
+                                                  nonce,
+                                                  g_ctx.sec_key[ring_idx]) != 0) {
+        return C_ERR;
+    }
+    if (pbytes > (unsigned long long)out_cap) return C_ERR;
+    *out_len = (uint32_t)pbytes;
+    return C_OK;
+}
+
 static uint32_t ring_next(uint32_t v, uint32_t cap) {
     return (v + 1U) % cap;
 }
@@ -216,7 +633,7 @@ static int tdx_ring_region_attach(void *base, size_t size, struct tdx_shm_region
     return C_OK;
 }
 
-static int queue_send(struct tdx_shm_queue_view *tx, uint32_t cid, uint16_t type, const unsigned char *payload, uint32_t len) {
+static int queue_send(struct tdx_shm_queue_view *tx, uint32_t cid, uint16_t type, uint16_t flags, const unsigned char *payload, uint32_t len) {
     cxl_shm_delay();
     if (!tx || !tx->q || !tx->data || !payload) return C_ERR;
     if (len > RING_MAX_PAYLOAD) return C_ERR;
@@ -237,7 +654,7 @@ static int queue_send(struct tdx_shm_queue_view *tx, uint32_t cid, uint16_t type
     struct ring_slot_hdr hdr;
     hdr.cid = cid;
     hdr.type = type;
-    hdr.flags = 0;
+    hdr.flags = flags;
     hdr.len = len;
     hdr.reserved = 0;
     memcpy(slot + sizeof(msg_len), &hdr, sizeof(hdr));
@@ -247,9 +664,9 @@ static int queue_send(struct tdx_shm_queue_view *tx, uint32_t cid, uint16_t type
     return 1;
 }
 
-static int queue_recv(struct tdx_shm_queue_view *rx, uint32_t *cid, uint16_t *type, unsigned char **payload, uint32_t *len) {
+static int queue_recv(struct tdx_shm_queue_view *rx, uint32_t *cid, uint16_t *type, uint16_t *flags, unsigned char **payload, uint32_t *len) {
     cxl_shm_delay();
-    if (!rx || !rx->q || !rx->data || !cid || !type || !payload || !len) return C_ERR;
+    if (!rx || !rx->q || !rx->data || !cid || !type || !flags || !payload || !len) return C_ERR;
 
     struct tdx_shm_queue *q = rx->q;
     uint32_t cap = q->capacity;
@@ -271,6 +688,7 @@ static int queue_recv(struct tdx_shm_queue_view *rx, uint32_t *cid, uint16_t *ty
 
     *cid = hdr.cid;
     *type = hdr.type;
+    *flags = hdr.flags;
     *len = hdr.len;
     *payload = slot + sizeof(msg_len) + sizeof(hdr);
 
@@ -286,13 +704,36 @@ static int send_binary_resp(int ring_idx, uint32_t cid, uint8_t status, const un
     buf[2] = (uint8_t)((vlen >> 8) & 0xff);
     buf[3] = 0;
     if (vlen) memcpy(buf + 4, val, vlen);
-    return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, buf, (uint32_t)(4U + (uint32_t)vlen));
+    uint32_t plain_len = (uint32_t)(4U + (uint32_t)vlen);
+    if (!g_ctx.secure_enabled) {
+        return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, 0, buf, plain_len);
+    }
+    unsigned char enc[RING_MAX_PAYLOAD];
+    uint32_t enc_len = 0;
+    if (sec_encrypt((uint32_t)ring_idx, cid, MSG_DATA, RING_FLAG_SECURE, buf, plain_len, SEC_DIR_RESP, enc, (uint32_t)sizeof(enc), &enc_len) != C_OK) {
+        return C_ERR;
+    }
+    return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
 }
 
-static void handle_request(int ring_idx, uint32_t cid, uint16_t msg_type, unsigned char *payload, uint32_t len) {
+static void handle_request(int ring_idx, uint32_t cid, uint16_t msg_type, uint16_t flags, unsigned char *payload, uint32_t len) {
     if (msg_type == MSG_CLOSE) return;
     if (msg_type != MSG_DATA) return;
     if (len < 4) return;
+
+    unsigned char dec[RING_MAX_PAYLOAD];
+    if (g_ctx.secure_enabled) {
+        if ((flags & RING_FLAG_SECURE) == 0) return;
+        uint32_t dec_len = 0;
+        if (sec_decrypt((uint32_t)ring_idx, cid, msg_type, flags, payload, len, dec, sizeof(dec), &dec_len) != C_OK) {
+            return;
+        }
+        payload = dec;
+        len = dec_len;
+        if (len < 4) return;
+    } else {
+        if ((flags & RING_FLAG_SECURE) != 0) return;
+    }
 
     uint8_t op = payload[0];
     uint8_t key_len = payload[1];
@@ -477,6 +918,12 @@ int cxlRingInitFromEnv(void) {
         return C_ERR;
     }
 
+    if (cxl_sec_init() != C_OK) {
+        munmap(g_ctx.mm, g_ctx.map_size);
+        close(g_ctx.fd);
+        return C_ERR;
+    }
+
     g_ctx.enabled = 1;
     if (!g_ctx.timer_id) {
         g_ctx.timer_id = aeCreateTimeEvent(server.el, 1, cxlRingCron, NULL, NULL);
@@ -507,10 +954,11 @@ void cxlRingBeforeSleep(void) {
     for (int r = 0; r < g_ctx.ring_count; r++) {
         uint32_t cid = 0, len = 0;
         uint16_t type = 0;
+        uint16_t flags = 0;
         unsigned char *payload = NULL;
         int iter = 0;
-        while (iter < 32768 && queue_recv(&g_ctx.req[r], &cid, &type, &payload, &len) > 0) {
-            handle_request(r, cid, type, payload, len);
+        while (iter < 32768 && queue_recv(&g_ctx.req[r], &cid, &type, &flags, &payload, &len) > 0) {
+            handle_request(r, cid, type, flags, payload, len);
             g_ctx.req_seen[r]++;
             if ((g_ctx.req_seen[r] % 20000ull) == 0) {
                 unsigned head = atomic_load_explicit(&g_ctx.req[r].q->head, memory_order_relaxed);
@@ -541,4 +989,3 @@ void cxlRingShutdown(void) {
     if (g_ctx.fd >= 0) close(g_ctx.fd);
     memset(&g_ctx, 0, sizeof(g_ctx));
 }
-
