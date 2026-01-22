@@ -63,6 +63,7 @@
 
 /* ring_slot_hdr.flags */
 #define RING_FLAG_SECURE 0x0001u
+#define RING_FLAG_RESP   0x0002u
 
 #define SEC_DIR_REQ 1u  /* client->server */
 #define SEC_DIR_RESP 2u /* server->client */
@@ -150,6 +151,25 @@ typedef struct {
 
 static CxlRingCtx g_ctx = {0};
 static int cxlRingCron(aeEventLoop *eventLoop, long long id, void *clientData);
+
+typedef struct RespConn {
+    uint32_t cid;
+    int ring_idx;
+    client *c;
+    sds out;
+    size_t out_off;
+    int closing;
+    int in_pending;
+    struct RespConn *pending_prev;
+    struct RespConn *pending_next;
+} RespConn;
+
+static RespConn **g_resp_map = NULL;
+static size_t g_resp_cap = 0;
+static RespConn *g_resp_pending_head = NULL;
+static connection g_resp_dummy_conn;
+
+static int queue_send(struct tdx_shm_queue_view *tx, uint32_t cid, uint16_t type, uint16_t flags, const unsigned char *payload, uint32_t len);
 
 static inline size_t align_up(size_t x, size_t a) {
     return (x + a - 1) / a * a;
@@ -582,6 +602,180 @@ static uint32_t ring_next(uint32_t v, uint32_t cap) {
     return (v + 1U) % cap;
 }
 
+static void resp_pending_add(RespConn *rc) {
+    if (!rc || rc->in_pending) return;
+    rc->in_pending = 1;
+    rc->pending_prev = NULL;
+    rc->pending_next = g_resp_pending_head;
+    if (g_resp_pending_head) g_resp_pending_head->pending_prev = rc;
+    g_resp_pending_head = rc;
+}
+
+static void resp_pending_remove(RespConn *rc) {
+    if (!rc || !rc->in_pending) return;
+    if (rc->pending_prev) rc->pending_prev->pending_next = rc->pending_next;
+    else g_resp_pending_head = rc->pending_next;
+    if (rc->pending_next) rc->pending_next->pending_prev = rc->pending_prev;
+    rc->pending_prev = NULL;
+    rc->pending_next = NULL;
+    rc->in_pending = 0;
+}
+
+static int resp_ensure_slot(uint32_t cid) {
+    if (cid < g_resp_cap) return C_OK;
+    size_t ncap = g_resp_cap ? g_resp_cap : 1024;
+    while (cid >= ncap) ncap *= 2;
+    RespConn **nm = zrealloc(g_resp_map, ncap * sizeof(nm[0]));
+    if (!nm) return C_ERR;
+    for (size_t i = g_resp_cap; i < ncap; i++) nm[i] = NULL;
+    g_resp_map = nm;
+    g_resp_cap = ncap;
+    return C_OK;
+}
+
+static void resp_conn_free(RespConn *rc) {
+    if (!rc) return;
+    resp_pending_remove(rc);
+    if (rc->cid < g_resp_cap) g_resp_map[rc->cid] = NULL;
+    if (rc->out) sdsfree(rc->out);
+    if (rc->c) freeClient(rc->c);
+    zfree(rc);
+}
+
+static RespConn *resp_get_or_create(uint32_t cid, int ring_idx) {
+    if (resp_ensure_slot(cid) != C_OK) return NULL;
+    RespConn *rc = g_resp_map[cid];
+    if (rc) {
+        if (ring_idx >= 0) rc->ring_idx = ring_idx;
+        return rc;
+    }
+    rc = zcalloc(sizeof(*rc));
+    if (!rc) return NULL;
+    rc->cid = cid;
+    rc->ring_idx = ring_idx;
+    rc->c = createClient(NULL);
+    if (!rc->c) {
+        zfree(rc);
+        return NULL;
+    }
+    /* Allow replies without an underlying socket connection. */
+    rc->c->flags |= CLIENT_MODULE | CLIENT_NO_EVICT;
+    rc->out = NULL;
+    rc->out_off = 0;
+    rc->closing = 0;
+    g_resp_map[cid] = rc;
+    return rc;
+}
+
+static void resp_drain_client_output(RespConn *rc) {
+    if (!rc || !rc->c) return;
+    client *c = rc->c;
+
+    if (c->bufpos) {
+        if (!rc->out) rc->out = sdsempty();
+        rc->out = sdscatlen(rc->out, c->buf, c->bufpos);
+        c->bufpos = 0;
+    }
+    while (listLength(c->reply)) {
+        listNode *ln = listFirst(c->reply);
+        clientReplyBlock *blk = ln ? listNodeValue(ln) : NULL;
+        if (blk && blk->used) {
+            if (!rc->out) rc->out = sdsempty();
+            rc->out = sdscatlen(rc->out, blk->buf, blk->used);
+        }
+        if (ln) listDelNode(c->reply, ln);
+    }
+    c->reply_bytes = 0;
+    c->sentlen = 0;
+}
+
+static int resp_process_input(client *c) {
+    if (!c) return C_ERR;
+    connection *saved = c->conn;
+    c->conn = &g_resp_dummy_conn;
+    int rc = processInputBuffer(c);
+    c->conn = saved;
+    return rc;
+}
+
+static int resp_send_close(int ring_idx, uint32_t cid) {
+    unsigned char dummy = 0;
+    uint16_t flags = RING_FLAG_RESP | (g_ctx.secure_enabled ? RING_FLAG_SECURE : 0);
+    return queue_send(&g_ctx.resp[ring_idx], cid, MSG_CLOSE, flags, &dummy, 1);
+}
+
+static int resp_send_chunk(int ring_idx, uint32_t cid, const unsigned char *payload, uint32_t len) {
+    if (len == 0) return 1;
+    if (!payload) return C_ERR;
+    if (!g_ctx.secure_enabled) {
+        return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, RING_FLAG_RESP, payload, len);
+    }
+    unsigned char enc[RING_MAX_PAYLOAD];
+    uint32_t enc_len = 0;
+    const uint16_t flags = RING_FLAG_RESP | RING_FLAG_SECURE;
+    if (sec_encrypt((uint32_t)ring_idx, cid, MSG_DATA, flags, payload, len, SEC_DIR_RESP, enc, (uint32_t)sizeof(enc), &enc_len) != C_OK) {
+        return C_ERR;
+    }
+    return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, flags, enc, enc_len);
+}
+
+static void resp_flush_one(RespConn *rc) {
+    if (!rc) return;
+    if (rc->ring_idx < 0 || rc->ring_idx >= g_ctx.ring_count) {
+        rc->closing = 1;
+        resp_pending_add(rc);
+        return;
+    }
+
+    if (rc->out && rc->out_off < sdslen(rc->out)) {
+        const uint32_t nonce_bytes = crypto_aead_chacha20poly1305_ietf_NPUBBYTES;
+        const uint32_t tag_bytes = crypto_aead_chacha20poly1305_ietf_ABYTES;
+        uint32_t chunk_max = RING_MAX_PAYLOAD;
+        if (g_ctx.secure_enabled) chunk_max = RING_MAX_PAYLOAD - nonce_bytes - tag_bytes;
+
+        while (rc->out && rc->out_off < sdslen(rc->out)) {
+            size_t avail = sdslen(rc->out) - rc->out_off;
+            uint32_t chunk = (uint32_t)((avail > chunk_max) ? chunk_max : avail);
+            const unsigned char *p = (const unsigned char *)rc->out + rc->out_off;
+            int sr = resp_send_chunk(rc->ring_idx, rc->cid, p, chunk);
+            if (sr == 1) {
+                rc->out_off += chunk;
+                continue;
+            }
+            /* full or error -> retry next loop */
+            resp_pending_add(rc);
+            return;
+        }
+    }
+
+    if (rc->out) {
+        sdsfree(rc->out);
+        rc->out = NULL;
+        rc->out_off = 0;
+    }
+
+    if (rc->closing) {
+        int sr = resp_send_close(rc->ring_idx, rc->cid);
+        if (sr == 1) {
+            resp_conn_free(rc);
+            return;
+        }
+        resp_pending_add(rc);
+        return;
+    }
+
+    resp_pending_remove(rc);
+}
+
+static void resp_flush_pending(int budget) {
+    RespConn *rc = g_resp_pending_head;
+    while (rc && budget-- > 0) {
+        RespConn *next = rc->pending_next;
+        resp_flush_one(rc);
+        rc = next;
+    }
+}
+
 static int tdx_ring_region_init(void *base, size_t size) {
     size_t header_size = align_up(sizeof(struct tdx_shm_header), 64U);
     size_t queue_bytes = (size_t)TDX_SHM_QUEUE_CAPACITY * (size_t)TDX_SHM_SLOT_SIZE;
@@ -717,9 +911,16 @@ static int send_binary_resp(int ring_idx, uint32_t cid, uint8_t status, const un
 }
 
 static void handle_request(int ring_idx, uint32_t cid, uint16_t msg_type, uint16_t flags, unsigned char *payload, uint32_t len) {
-    if (msg_type == MSG_CLOSE) return;
+    if (msg_type == MSG_CLOSE) {
+        if (flags & RING_FLAG_RESP) {
+            if (cid < g_resp_cap) {
+                RespConn *rc = g_resp_map[cid];
+                if (rc) resp_conn_free(rc);
+            }
+        }
+        return;
+    }
     if (msg_type != MSG_DATA) return;
-    if (len < 4) return;
 
     unsigned char dec[RING_MAX_PAYLOAD];
     if (g_ctx.secure_enabled) {
@@ -735,6 +936,21 @@ static void handle_request(int ring_idx, uint32_t cid, uint16_t msg_type, uint16
         if ((flags & RING_FLAG_SECURE) != 0) return;
     }
 
+    if (flags & RING_FLAG_RESP) {
+        RespConn *rc = resp_get_or_create(cid, ring_idx);
+        if (!rc) return;
+        if (!rc->c->querybuf) rc->c->querybuf = sdsempty();
+        rc->c->querybuf = sdscatlen(rc->c->querybuf, payload, len);
+        if (resp_process_input(rc->c) != C_OK) {
+            rc->closing = 1;
+        }
+        resp_drain_client_output(rc);
+        if (rc->out || rc->closing) resp_pending_add(rc);
+        resp_flush_one(rc);
+        return;
+    }
+
+    if (len < 4) return;
     uint8_t op = payload[0];
     uint8_t key_len = payload[1];
     uint16_t val_len = payload[2] | ((uint16_t)payload[3] << 8);
@@ -850,14 +1066,14 @@ int cxlRingInitFromEnv(void) {
 
     const char *ms = getenv("CXL_RING_MAP_SIZE");
     if (ms) {
-        unsigned long long v = strtoull(ms, NULL, 0);
-        if (v > 0) map_size = (size_t)v;
+        size_t v = 0;
+        if (parse_size(ms, &v) == C_OK && v > 0) map_size = v;
     }
     const char *mo = getenv("CXL_RING_OFFSET");
     if (!mo || !mo[0]) mo = getenv("CXL_SHM_OFFSET");
     if (mo && mo[0]) {
-        unsigned long long v = strtoull(mo, NULL, 0);
-        if (v > 0) map_offset = (size_t)v;
+        size_t v = 0;
+        if (parse_size(mo, &v) == C_OK && v > 0) map_offset = v;
     }
 
     g_ctx.region_size = env_size("CXL_RING_REGION_SIZE", (size_t)TDX_SHM_DEFAULT_TOTAL_SIZE);
@@ -969,6 +1185,9 @@ void cxlRingBeforeSleep(void) {
             iter++;
         }
     }
+
+    /* Best-effort flush of pending RESP replies / closes. */
+    resp_flush_pending(1024);
 }
 
 static int cxlRingCron(aeEventLoop *eventLoop, long long id, void *clientData) {
@@ -984,6 +1203,16 @@ void cxlRingShutdown(void) {
     if (!g_ctx.enabled) return;
     if (g_ctx.timer_id > 0 && server.el) {
         aeDeleteTimeEvent(server.el, g_ctx.timer_id);
+    }
+    if (g_resp_map) {
+        for (size_t i = 0; i < g_resp_cap; i++) {
+            RespConn *rc = g_resp_map[i];
+            if (rc) resp_conn_free(rc);
+        }
+        zfree(g_resp_map);
+        g_resp_map = NULL;
+        g_resp_cap = 0;
+        g_resp_pending_head = NULL;
     }
     if (g_ctx.mm && g_ctx.mm != MAP_FAILED) munmap(g_ctx.mm, g_ctx.map_size);
     if (g_ctx.fd >= 0) close(g_ctx.fd);
