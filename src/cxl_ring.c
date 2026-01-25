@@ -141,12 +141,21 @@ typedef struct {
     unsigned long long req_seen[MAX_RINGS];
 
     int secure_enabled;
+    int crypto_enabled; /* manager-less crypto mode (vm key + common key) */
     uint64_t sec_node_id;
     unsigned sec_timeout_ms;
     char sec_mgr[256];
     unsigned char sec_key[MAX_RINGS][crypto_aead_chacha20poly1305_ietf_KEYBYTES];
     int sec_key_ok[MAX_RINGS];
     atomic_uint_fast64_t sec_nonce_ctr_resp[MAX_RINGS];
+
+    /* Crypto mode: per-node private staging area (encrypted with VM key). */
+    unsigned char crypto_vm_key[crypto_stream_chacha20_ietf_KEYBYTES];
+    unsigned char crypto_common_key[crypto_stream_chacha20_ietf_KEYBYTES];
+    size_t crypto_priv_region_base;
+    size_t crypto_priv_region_size;
+    unsigned char *crypto_priv; /* this node's private region (within shared mmap) */
+    atomic_uint_fast64_t crypto_priv_nonce_ctr[MAX_RINGS];
 } CxlRingCtx;
 
 static CxlRingCtx g_ctx = {0};
@@ -252,6 +261,14 @@ static int env_enabled(const char *key) {
     if (!v || !v[0]) return 0;
     if (!strcmp(v, "0") || !strcasecmp(v, "false") || !strcasecmp(v, "no")) return 0;
     return 1;
+}
+
+static int parse_key_hex(const char *hex, unsigned char *out_key, size_t out_len) {
+    if (!hex || !hex[0] || !out_key || out_len == 0) return C_ERR;
+    size_t bin_len = 0;
+    if (sodium_hex2bin(out_key, out_len, hex, strlen(hex), NULL, &bin_len, NULL) != 0) return C_ERR;
+    if (bin_len != out_len) return C_ERR;
+    return C_OK;
 }
 
 static int parse_hostport(const char *s, char **host_out, char **port_out) {
@@ -407,6 +424,103 @@ out:
     return rc;
 }
 
+static int crypto_priv_init(void) {
+    if (!g_ctx.crypto_enabled) return C_OK;
+    if (!g_ctx.mm || g_ctx.mm == MAP_FAILED) return C_ERR;
+    if (g_ctx.ring_count < 1 || g_ctx.ring_count > MAX_RINGS) return C_ERR;
+    if (g_ctx.sec_node_id == 0) {
+        serverLog(LL_WARNING, "cxl_crypto: requires CXL_SEC_NODE_ID");
+        return C_ERR;
+    }
+
+    const size_t slot_stride = (size_t)TDX_SHM_SLOT_SIZE;
+    const size_t need_bytes = align_up((size_t)g_ctx.ring_count * slot_stride, 4096U);
+
+    const size_t def_base = align_up(g_ctx.region_base + (size_t)g_ctx.ring_count * g_ctx.region_size, 4096U);
+    const size_t base = env_size("CXL_CRYPTO_PRIV_REGION_BASE", def_base);
+    const size_t per_node = env_size("CXL_CRYPTO_PRIV_REGION_SIZE", need_bytes);
+    if ((base % 4096) != 0 || (per_node % 4096) != 0) {
+        serverLog(LL_WARNING,
+                  "cxl_crypto: CXL_CRYPTO_PRIV_REGION_BASE/SIZE must be 4K-aligned (base=%zu size=%zu)",
+                  base, per_node);
+        return C_ERR;
+    }
+    if (per_node < need_bytes) {
+        serverLog(LL_WARNING,
+                  "cxl_crypto: CXL_CRYPTO_PRIV_REGION_SIZE too small (need >= %zu, got %zu)",
+                  need_bytes, per_node);
+        return C_ERR;
+    }
+
+    uint64_t idx = g_ctx.sec_node_id - 1ULL;
+    uint64_t off64 = (uint64_t)base + idx * (uint64_t)per_node;
+    if (off64 > (uint64_t)g_ctx.map_size || (uint64_t)per_node > (uint64_t)g_ctx.map_size - off64) {
+        serverLog(LL_WARNING,
+                  "cxl_crypto: private region out of range (map_size=%zu base=%zu node=%llu per_node=%zu)",
+                  g_ctx.map_size, base, (unsigned long long)g_ctx.sec_node_id, per_node);
+        return C_ERR;
+    }
+
+    g_ctx.crypto_priv_region_base = base;
+    g_ctx.crypto_priv_region_size = per_node;
+    g_ctx.crypto_priv = g_ctx.mm + (size_t)off64;
+    memset(g_ctx.crypto_priv, 0, per_node);
+    for (int i = 0; i < g_ctx.ring_count; i++) {
+        atomic_store_explicit(&g_ctx.crypto_priv_nonce_ctr[i], 0, memory_order_relaxed);
+    }
+
+    serverLog(LL_NOTICE,
+              "cxl_crypto: private region ready (node_id=%llu base=%zu per_node=%zu need=%zu)",
+              (unsigned long long)g_ctx.sec_node_id, base, per_node, need_bytes);
+    return C_OK;
+}
+
+static int crypto_priv_encrypt_then_decrypt(uint32_t ring_idx,
+                                            unsigned dir,
+                                            const unsigned char *payload,
+                                            uint32_t payload_len,
+                                            unsigned char *out,
+                                            uint32_t out_cap,
+                                            uint32_t *out_len) {
+    if (!out || !out_len || !payload) return C_ERR;
+    if (!g_ctx.crypto_enabled || !g_ctx.crypto_priv) return C_ERR;
+    if (ring_idx >= (uint32_t)g_ctx.ring_count || ring_idx >= MAX_RINGS) return C_ERR;
+    if (payload_len > out_cap) return C_ERR;
+
+    const size_t slot_stride = (size_t)TDX_SHM_SLOT_SIZE;
+    const uint32_t nonce_bytes = crypto_stream_chacha20_ietf_NONCEBYTES;
+    if ((size_t)payload_len + (size_t)nonce_bytes > slot_stride) return C_ERR;
+
+    unsigned char *slot = g_ctx.crypto_priv + (size_t)ring_idx * slot_stride;
+    unsigned char *nonce = slot;
+    unsigned char *cipher = slot + nonce_bytes;
+
+    cxl_shm_delay();
+    memset(nonce, 0, nonce_bytes);
+    nonce[0] = (unsigned char)(dir & 0xffu);
+    nonce[1] = (unsigned char)(ring_idx & 0xffu);
+    uint64_t ctr = atomic_fetch_add_explicit(&g_ctx.crypto_priv_nonce_ctr[ring_idx], 1, memory_order_relaxed);
+    for (int i = 0; i < 8; i++) {
+        nonce[4 + i] = (unsigned char)((ctr >> (8 * i)) & 0xffu);
+    }
+
+    memcpy(cipher, payload, payload_len);
+    crypto_stream_chacha20_ietf_xor(cipher,
+                                    cipher,
+                                    (unsigned long long)payload_len,
+                                    nonce,
+                                    g_ctx.crypto_vm_key);
+
+    cxl_shm_delay();
+    crypto_stream_chacha20_ietf_xor(out,
+                                    cipher,
+                                    (unsigned long long)payload_len,
+                                    nonce,
+                                    g_ctx.crypto_vm_key);
+    *out_len = payload_len;
+    return C_OK;
+}
+
 static int cxl_sec_init(void) {
     g_ctx.secure_enabled = env_enabled("CXL_SEC_ENABLE");
     if (!g_ctx.secure_enabled) return C_OK;
@@ -415,13 +529,6 @@ static int cxl_sec_init(void) {
         serverLog(LL_WARNING, "cxl_sec: sodium_init failed");
         return C_ERR;
     }
-
-    const char *mgr = getenv("CXL_SEC_MGR");
-    if (!mgr || !mgr[0]) {
-        serverLog(LL_WARNING, "cxl_sec: CXL_SEC_ENABLE=1 requires CXL_SEC_MGR=ip:port");
-        return C_ERR;
-    }
-    snprintf(g_ctx.sec_mgr, sizeof(g_ctx.sec_mgr), "%s", mgr);
 
     const char *id_env = getenv("CXL_SEC_NODE_ID");
     if (!id_env || !id_env[0]) {
@@ -439,6 +546,45 @@ static int cxl_sec_init(void) {
     if (to_env && to_env[0]) {
         g_ctx.sec_timeout_ms = (unsigned)strtoul(to_env, NULL, 0);
     }
+
+    const char *key_hex = getenv("CXL_SEC_KEY_HEX");
+    if (key_hex && key_hex[0]) {
+        /* Crypto mode: no manager, pre-shared keys (VM key + common key). */
+        const char *common_hex = getenv("CXL_SEC_COMMON_KEY_HEX");
+        if (!common_hex || !common_hex[0]) {
+            serverLog(LL_WARNING, "cxl_crypto: CXL_SEC_KEY_HEX requires CXL_SEC_COMMON_KEY_HEX");
+            return C_ERR;
+        }
+        if (parse_key_hex(key_hex, g_ctx.crypto_vm_key, sizeof(g_ctx.crypto_vm_key)) != C_OK) {
+            serverLog(LL_WARNING, "cxl_crypto: invalid CXL_SEC_KEY_HEX (expected %d bytes hex)",
+                      (int)sizeof(g_ctx.crypto_vm_key));
+            return C_ERR;
+        }
+        if (parse_key_hex(common_hex, g_ctx.crypto_common_key, sizeof(g_ctx.crypto_common_key)) != C_OK) {
+            serverLog(LL_WARNING, "cxl_crypto: invalid CXL_SEC_COMMON_KEY_HEX (expected %d bytes hex)",
+                      (int)sizeof(g_ctx.crypto_common_key));
+            return C_ERR;
+        }
+        g_ctx.crypto_enabled = 1;
+        memset(g_ctx.sec_mgr, 0, sizeof(g_ctx.sec_mgr));
+        memset(g_ctx.sec_key_ok, 0, sizeof(g_ctx.sec_key_ok));
+        for (int i = 0; i < g_ctx.ring_count && i < MAX_RINGS; i++) {
+            memcpy(g_ctx.sec_key[i], g_ctx.crypto_common_key, crypto_aead_chacha20poly1305_ietf_KEYBYTES);
+            g_ctx.sec_key_ok[i] = 1;
+            atomic_store_explicit(&g_ctx.sec_nonce_ctr_resp[i], 0, memory_order_relaxed);
+        }
+        if (crypto_priv_init() != C_OK) return C_ERR;
+        serverLog(LL_NOTICE, "cxl_crypto: enabled (node_id=%llu)", (unsigned long long)g_ctx.sec_node_id);
+        return C_OK;
+    }
+
+    /* Secure mode: manager-backed ACL table + per-ring key. */
+    const char *mgr = getenv("CXL_SEC_MGR");
+    if (!mgr || !mgr[0]) {
+        serverLog(LL_WARNING, "cxl_sec: CXL_SEC_ENABLE=1 requires either CXL_SEC_KEY_HEX=<hex> or CXL_SEC_MGR=ip:port");
+        return C_ERR;
+    }
+    snprintf(g_ctx.sec_mgr, sizeof(g_ctx.sec_mgr), "%s", mgr);
 
     if (g_ctx.region_base < 4096) {
         serverLog(LL_WARNING, "cxl_sec: secure mode requires CXL_RING_REGION_BASE >= 4096");
@@ -713,7 +859,23 @@ static int resp_send_chunk(int ring_idx, uint32_t cid, const unsigned char *payl
     unsigned char enc[RING_MAX_PAYLOAD];
     uint32_t enc_len = 0;
     const uint16_t flags = RING_FLAG_RESP | RING_FLAG_SECURE;
-    if (sec_encrypt((uint32_t)ring_idx, cid, MSG_DATA, flags, payload, len, SEC_DIR_RESP, enc, (uint32_t)sizeof(enc), &enc_len) != C_OK) {
+    const unsigned char *plain = payload;
+    unsigned char staged[RING_MAX_PAYLOAD];
+    uint32_t staged_len = 0;
+    if (g_ctx.crypto_enabled) {
+        if (crypto_priv_encrypt_then_decrypt((uint32_t)ring_idx,
+                                             SEC_DIR_RESP,
+                                             payload,
+                                             len,
+                                             staged,
+                                             (uint32_t)sizeof(staged),
+                                             &staged_len) != C_OK) {
+            return C_ERR;
+        }
+        plain = staged;
+        len = staged_len;
+    }
+    if (sec_encrypt((uint32_t)ring_idx, cid, MSG_DATA, flags, plain, len, SEC_DIR_RESP, enc, (uint32_t)sizeof(enc), &enc_len) != C_OK) {
         return C_ERR;
     }
     return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, flags, enc, enc_len);
@@ -904,7 +1066,23 @@ static int send_binary_resp(int ring_idx, uint32_t cid, uint8_t status, const un
     }
     unsigned char enc[RING_MAX_PAYLOAD];
     uint32_t enc_len = 0;
-    if (sec_encrypt((uint32_t)ring_idx, cid, MSG_DATA, RING_FLAG_SECURE, buf, plain_len, SEC_DIR_RESP, enc, (uint32_t)sizeof(enc), &enc_len) != C_OK) {
+    const unsigned char *plain = buf;
+    unsigned char staged[RING_MAX_PAYLOAD];
+    uint32_t staged_len = 0;
+    if (g_ctx.crypto_enabled) {
+        if (crypto_priv_encrypt_then_decrypt((uint32_t)ring_idx,
+                                             SEC_DIR_RESP,
+                                             buf,
+                                             plain_len,
+                                             staged,
+                                             (uint32_t)sizeof(staged),
+                                             &staged_len) != C_OK) {
+            return C_ERR;
+        }
+        plain = staged;
+        plain_len = staged_len;
+    }
+    if (sec_encrypt((uint32_t)ring_idx, cid, MSG_DATA, RING_FLAG_SECURE, plain, plain_len, SEC_DIR_RESP, enc, (uint32_t)sizeof(enc), &enc_len) != C_OK) {
         return C_ERR;
     }
     return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
