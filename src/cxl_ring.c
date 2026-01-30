@@ -10,9 +10,16 @@
  *   16B header: cid,u16 type,u16 flags,u32 len,u32 reserved
  *   payload (len bytes)
  *
- * Payload protocol (binary GET/SET):
- *   Request:  u8 op (1=GET,2=SET), u8 key_len, u16 val_len (LE), key, val
- *   Response: u8 status (0=OK,1=MISS,2=ERR), u16 val_len (LE), u8 reserved, val
+ * Payload protocol (binary GET/SET/DEL/SCAN):
+ *   Request:
+ *     u8 op (1=GET,2=SET,3=DEL,4=SCAN), u8 key_len, u16 val_len (LE), key, val
+ *     - DEL: val_len=0
+ *     - SCAN: val_len>=2 (u16 count). If val_len>=10, includes u64 cursor + u16 count.
+ *   Response (GET/SET/DEL):
+ *     u8 status (0=OK,1=MISS,2=ERR), u16 val_len (LE), u8 reserved, val
+ *   Response (SCAN):
+ *     u8 status, u16 count (LE), u8 reserved, u64 next_cursor (LE),
+ *     then repeated [u16 val_len (LE), val_bytes]
  */
 
 #include "server.h"
@@ -103,7 +110,9 @@ struct sec_resp {
 
 enum {
     CXL_OP_GET = 1,
-    CXL_OP_SET = 2
+    CXL_OP_SET = 2,
+    CXL_OP_DEL = 3,
+    CXL_OP_SCAN = 4
 };
 enum {
     CXL_STATUS_OK = 0,
@@ -1052,6 +1061,35 @@ static int queue_recv(struct tdx_shm_queue_view *rx, uint32_t *cid, uint16_t *ty
     return 1;
 }
 
+static int send_binary_payload(int ring_idx, uint32_t cid, const unsigned char *plain, uint32_t plain_len) {
+    if (!plain || plain_len == 0 || plain_len > RING_MAX_PAYLOAD) return C_ERR;
+    if (!g_ctx.secure_enabled) {
+        return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, 0, plain, plain_len);
+    }
+    unsigned char enc[RING_MAX_PAYLOAD];
+    uint32_t enc_len = 0;
+    const unsigned char *payload = plain;
+    unsigned char staged[RING_MAX_PAYLOAD];
+    uint32_t staged_len = 0;
+    if (g_ctx.crypto_enabled) {
+        if (crypto_priv_encrypt_then_decrypt((uint32_t)ring_idx,
+                                             SEC_DIR_RESP,
+                                             plain,
+                                             plain_len,
+                                             staged,
+                                             (uint32_t)sizeof(staged),
+                                             &staged_len) != C_OK) {
+            return C_ERR;
+        }
+        payload = staged;
+        plain_len = staged_len;
+    }
+    if (sec_encrypt((uint32_t)ring_idx, cid, MSG_DATA, RING_FLAG_SECURE, payload, plain_len, SEC_DIR_RESP, enc, (uint32_t)sizeof(enc), &enc_len) != C_OK) {
+        return C_ERR;
+    }
+    return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
+}
+
 static int send_binary_resp(int ring_idx, uint32_t cid, uint8_t status, const unsigned char *val, uint16_t vlen) {
     unsigned char buf[TDX_SHM_SLOT_SIZE];
     if ((uint32_t)(4U + (uint32_t)vlen) > RING_MAX_PAYLOAD) return C_ERR;
@@ -1060,32 +1098,58 @@ static int send_binary_resp(int ring_idx, uint32_t cid, uint8_t status, const un
     buf[2] = (uint8_t)((vlen >> 8) & 0xff);
     buf[3] = 0;
     if (vlen) memcpy(buf + 4, val, vlen);
-    uint32_t plain_len = (uint32_t)(4U + (uint32_t)vlen);
-    if (!g_ctx.secure_enabled) {
-        return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, 0, buf, plain_len);
+    return send_binary_payload(ring_idx, cid, buf, (uint32_t)(4U + (uint32_t)vlen));
+}
+
+struct scan_collect {
+    unsigned char *buf;
+    size_t cap;
+    size_t off;
+    uint16_t count;
+    uint16_t max_count;
+    int full;
+};
+
+static void scan_collect_cb(void *privdata, const dictEntry *de, dictEntry **plink) {
+    (void)plink;
+    struct scan_collect *sc = (struct scan_collect *)privdata;
+    if (!sc || sc->full || sc->count >= sc->max_count) return;
+    robj *o = (robj *)dictGetVal(de);
+    if (!o || o->type != OBJ_STRING) return;
+    robj *dec = getDecodedObject(o);
+    size_t vlen = sdslen(dec->ptr);
+    if (vlen > 0xffff) {
+        decrRefCount(dec);
+        return;
     }
-    unsigned char enc[RING_MAX_PAYLOAD];
-    uint32_t enc_len = 0;
-    const unsigned char *plain = buf;
-    unsigned char staged[RING_MAX_PAYLOAD];
-    uint32_t staged_len = 0;
-    if (g_ctx.crypto_enabled) {
-        if (crypto_priv_encrypt_then_decrypt((uint32_t)ring_idx,
-                                             SEC_DIR_RESP,
-                                             buf,
-                                             plain_len,
-                                             staged,
-                                             (uint32_t)sizeof(staged),
-                                             &staged_len) != C_OK) {
-            return C_ERR;
-        }
-        plain = staged;
-        plain_len = staged_len;
+    size_t need = 2U + vlen;
+    if (sc->off + need > sc->cap) {
+        sc->full = 1;
+        decrRefCount(dec);
+        return;
     }
-    if (sec_encrypt((uint32_t)ring_idx, cid, MSG_DATA, RING_FLAG_SECURE, plain, plain_len, SEC_DIR_RESP, enc, (uint32_t)sizeof(enc), &enc_len) != C_OK) {
-        return C_ERR;
+    sc->buf[sc->off] = (uint8_t)(vlen & 0xff);
+    sc->buf[sc->off + 1] = (uint8_t)((vlen >> 8) & 0xff);
+    memcpy(sc->buf + sc->off + 2, dec->ptr, vlen);
+    sc->off += need;
+    sc->count++;
+    decrRefCount(dec);
+}
+
+static int send_scan_resp(int ring_idx, uint32_t cid, uint8_t status, uint16_t count, uint64_t next_cursor,
+                          const unsigned char *vals, uint32_t vals_len) {
+    unsigned char buf[TDX_SHM_SLOT_SIZE];
+    const size_t header_len = 12U;
+    if (header_len + vals_len > RING_MAX_PAYLOAD) return C_ERR;
+    buf[0] = status;
+    buf[1] = (uint8_t)(count & 0xff);
+    buf[2] = (uint8_t)((count >> 8) & 0xff);
+    buf[3] = 0;
+    for (int i = 0; i < 8; i++) {
+        buf[4 + i] = (uint8_t)((next_cursor >> (8 * i)) & 0xff);
     }
-    return queue_send(&g_ctx.resp[ring_idx], cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
+    if (vals_len && vals) memcpy(buf + header_len, vals, vals_len);
+    return send_binary_payload(ring_idx, cid, buf, (uint32_t)(header_len + vals_len));
 }
 
 static void handle_request(int ring_idx, uint32_t cid, uint16_t msg_type, uint16_t flags, unsigned char *payload, uint32_t len) {
@@ -1172,6 +1236,58 @@ static void handle_request(int ring_idx, uint32_t cid, uint16_t msg_type, uint16
         server.dirty++;
         (void)send_binary_resp(ring_idx, cid, CXL_STATUS_OK, NULL, 0);
         decrRefCount(keyobj);
+    } else if (op == CXL_OP_DEL) {
+        robj *keyobj = createRawStringObject((const char *)key, key_len);
+        int removed = dbDelete(db, keyobj);
+        if (removed) {
+            signalModifiedKey(NULL, db, keyobj);
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyobj, db->id);
+            server.dirty++;
+            (void)send_binary_resp(ring_idx, cid, CXL_STATUS_OK, NULL, 0);
+        } else {
+            (void)send_binary_resp(ring_idx, cid, CXL_STATUS_MISS, NULL, 0);
+        }
+        decrRefCount(keyobj);
+    } else if (op == CXL_OP_SCAN) {
+        uint16_t count = 0;
+        uint64_t cursor = 0;
+        if (val_len >= 2) {
+            count = (uint16_t)val[0] | ((uint16_t)val[1] << 8);
+        }
+        if (val_len >= 10) {
+            cursor =  ((uint64_t)val[0]) |
+                     ((uint64_t)val[1] << 8) |
+                     ((uint64_t)val[2] << 16) |
+                     ((uint64_t)val[3] << 24) |
+                     ((uint64_t)val[4] << 32) |
+                     ((uint64_t)val[5] << 40) |
+                     ((uint64_t)val[6] << 48) |
+                     ((uint64_t)val[7] << 56);
+            count = (uint16_t)val[8] | ((uint16_t)val[9] << 8);
+        }
+        if (count == 0) count = 1;
+
+        unsigned char out[RING_MAX_PAYLOAD];
+        const size_t header_len = 12U;
+        struct scan_collect sc;
+        sc.buf = out + header_len;
+        sc.cap = RING_MAX_PAYLOAD - header_len;
+        sc.off = 0;
+        sc.count = 0;
+        sc.max_count = count;
+        sc.full = 0;
+
+        unsigned long long cur = cursor;
+        int iter = 0;
+        do {
+            cur = kvstoreScan(db->keys, cur, -1, scan_collect_cb, NULL, &sc);
+            iter++;
+            if (iter > 1024) break;
+        } while (cur != 0 && sc.count < sc.max_count && !sc.full);
+
+        if (send_scan_resp(ring_idx, cid, CXL_STATUS_OK, sc.count, (uint64_t)cur, sc.buf, (uint32_t)sc.off) != C_OK) {
+            (void)send_binary_resp(ring_idx, cid, CXL_STATUS_ERR, NULL, 0);
+        }
     } else {
         (void)send_binary_resp(ring_idx, cid, CXL_STATUS_ERR, NULL, 0);
     }
