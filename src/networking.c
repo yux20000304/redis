@@ -3324,6 +3324,14 @@ done:
  * anetFdToString implementation for more info). */
 void genClientAddrString(client *client, char *addr,
                          size_t addr_len, int remote) {
+    if (!client) {
+        snprintf(addr,addr_len,"?:0");
+        return;
+    }
+    if (client->conn == NULL) {
+        snprintf(addr,addr_len,"?:0");
+        return;
+    }
     if (client->flags & CLIENT_UNIX_SOCKET) {
         /* Unix socket client. */
         snprintf(addr,addr_len,"%s:0",server.unixsocket);
@@ -3338,6 +3346,8 @@ void genClientAddrString(client *client, char *addr,
  * The Peer ID never changes during the life of the client, however it
  * is expensive to compute. */
 char *getClientPeerId(client *c) {
+    static char unknown_peerid[] = "?:0";
+    if (!c) return unknown_peerid;
     char peerid[NET_ADDR_STR_LEN] = {0};
 
     if (c->peerid == NULL) {
@@ -3352,6 +3362,8 @@ char *getClientPeerId(client *c) {
  * The Socket Name never changes during the life of the client, however it
  * is expensive to compute. */
 char *getClientSockname(client *c) {
+    static char unknown_sockname[] = "?:0";
+    if (!c) return unknown_sockname;
     char sockname[NET_ADDR_STR_LEN] = {0};
 
     if (c->sockname == NULL) {
