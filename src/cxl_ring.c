@@ -165,6 +165,16 @@ typedef struct {
     size_t crypto_priv_region_size;
     unsigned char *crypto_priv; /* this node's private region (within shared mmap) */
     atomic_uint_fast64_t crypto_priv_nonce_ctr[MAX_RINGS];
+
+    int stats_enabled;
+    char stats_path[PATH_MAX];
+    atomic_uint_fast64_t stats_copy_ns;
+    atomic_uint_fast64_t stats_copy_bytes;
+    atomic_uint_fast64_t stats_ring_send_ns;
+    atomic_uint_fast64_t stats_ring_recv_ns;
+    atomic_uint_fast64_t stats_crypto_ns;
+    atomic_uint_fast64_t stats_crypto_in_bytes;
+    atomic_uint_fast64_t stats_crypto_out_bytes;
 } CxlRingCtx;
 
 static CxlRingCtx g_ctx = {0};
@@ -197,6 +207,46 @@ static inline uint64_t nowns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static inline void stats_add(atomic_uint_fast64_t *dst, uint64_t v) {
+    atomic_fetch_add_explicit(dst, v, memory_order_relaxed);
+}
+
+static inline void *memcpy_stats(void *dst, const void *src, size_t n) {
+    if (!g_ctx.stats_enabled) return memcpy(dst, src, n);
+    uint64_t t0 = nowns();
+    void *ret = memcpy(dst, src, n);
+    uint64_t t1 = nowns();
+    stats_add(&g_ctx.stats_copy_ns, t1 - t0);
+    stats_add(&g_ctx.stats_copy_bytes, (uint64_t)n);
+    return ret;
+}
+
+static void cxl_ring_write_stats(void) {
+    if (!g_ctx.stats_enabled || !g_ctx.stats_path[0]) return;
+    FILE *f = fopen(g_ctx.stats_path, "w");
+    if (!f) return;
+    fprintf(f,
+            "{\n"
+            "  \"pid\": %d,\n"
+            "  \"copy_ns\": %llu,\n"
+            "  \"copy_bytes\": %llu,\n"
+            "  \"ring_send_ns\": %llu,\n"
+            "  \"ring_recv_ns\": %llu,\n"
+            "  \"crypto_ns\": %llu,\n"
+            "  \"crypto_in_bytes\": %llu,\n"
+            "  \"crypto_out_bytes\": %llu\n"
+            "}\n",
+            (int)getpid(),
+            (unsigned long long)atomic_load_explicit(&g_ctx.stats_copy_ns, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_ctx.stats_copy_bytes, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_ctx.stats_ring_send_ns, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_ctx.stats_ring_recv_ns, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_ctx.stats_crypto_ns, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_ctx.stats_crypto_in_bytes, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_ctx.stats_crypto_out_bytes, memory_order_relaxed));
+    fclose(f);
 }
 
 static void cxl_shm_delay_calibrate(void) {
@@ -291,7 +341,7 @@ static int parse_hostport(const char *s, char **host_out, char **port_out) {
         zfree(port);
         return -1;
     }
-    memcpy(host, s, host_len);
+    memcpy_stats(host, s, host_len);
     host[host_len] = '\0';
     *host_out = host;
     *port_out = port;
@@ -513,19 +563,30 @@ static int crypto_priv_encrypt_then_decrypt(uint32_t ring_idx,
         nonce[4 + i] = (unsigned char)((ctr >> (8 * i)) & 0xffu);
     }
 
-    memcpy(cipher, payload, payload_len);
+    memcpy_stats(cipher, payload, payload_len);
+    uint64_t t0 = 0;
+    if (g_ctx.stats_enabled) t0 = nowns();
     crypto_stream_chacha20_ietf_xor(cipher,
                                     cipher,
                                     (unsigned long long)payload_len,
                                     nonce,
                                     g_ctx.crypto_vm_key);
+    if (g_ctx.stats_enabled) {
+        stats_add(&g_ctx.stats_crypto_ns, nowns() - t0);
+        stats_add(&g_ctx.stats_crypto_in_bytes, payload_len);
+    }
 
     cxl_shm_delay();
+    if (g_ctx.stats_enabled) t0 = nowns();
     crypto_stream_chacha20_ietf_xor(out,
                                     cipher,
                                     (unsigned long long)payload_len,
                                     nonce,
                                     g_ctx.crypto_vm_key);
+    if (g_ctx.stats_enabled) {
+        stats_add(&g_ctx.stats_crypto_ns, nowns() - t0);
+        stats_add(&g_ctx.stats_crypto_out_bytes, payload_len);
+    }
     *out_len = payload_len;
     return C_OK;
 }
@@ -578,7 +639,7 @@ static int cxl_sec_init(void) {
         memset(g_ctx.sec_mgr, 0, sizeof(g_ctx.sec_mgr));
         memset(g_ctx.sec_key_ok, 0, sizeof(g_ctx.sec_key_ok));
         for (int i = 0; i < g_ctx.ring_count && i < MAX_RINGS; i++) {
-            memcpy(g_ctx.sec_key[i], g_ctx.crypto_common_key, crypto_aead_chacha20poly1305_ietf_KEYBYTES);
+            memcpy_stats(g_ctx.sec_key[i], g_ctx.crypto_common_key, crypto_aead_chacha20poly1305_ietf_KEYBYTES);
             g_ctx.sec_key_ok[i] = 1;
             atomic_store_explicit(&g_ctx.sec_nonce_ctr_resp[i], 0, memory_order_relaxed);
         }
@@ -639,7 +700,7 @@ static int cxl_sec_init(void) {
             return C_ERR;
         }
 
-        memcpy(g_ctx.sec_key[i], t->entries[idx].key, crypto_aead_chacha20poly1305_ietf_KEYBYTES);
+        memcpy_stats(g_ctx.sec_key[i], t->entries[idx].key, crypto_aead_chacha20poly1305_ietf_KEYBYTES);
         g_ctx.sec_key_ok[i] = 1;
         atomic_store_explicit(&g_ctx.sec_nonce_ctr_resp[i], 0, memory_order_relaxed);
     }
@@ -687,8 +748,10 @@ static int sec_encrypt(uint32_t ring_idx,
         nonce[4 + i] = (unsigned char)((ctr >> (8 * i)) & 0xffu);
     }
 
-    memcpy(out, nonce, nonce_bytes);
+    memcpy_stats(out, nonce, nonce_bytes);
     unsigned long long cbytes = 0;
+    uint64_t t0 = 0;
+    if (g_ctx.stats_enabled) t0 = nowns();
     if (crypto_aead_chacha20poly1305_ietf_encrypt(out + nonce_bytes,
                                                   &cbytes,
                                                   payload,
@@ -699,6 +762,10 @@ static int sec_encrypt(uint32_t ring_idx,
                                                   nonce,
                                                   g_ctx.sec_key[ring_idx]) != 0) {
         return C_ERR;
+    }
+    if (g_ctx.stats_enabled) {
+        stats_add(&g_ctx.stats_crypto_ns, nowns() - t0);
+        stats_add(&g_ctx.stats_crypto_in_bytes, payload_len);
     }
     if (cbytes != (unsigned long long)(payload_len + tag_bytes)) return C_ERR;
     *out_len = (uint32_t)(nonce_bytes + (uint32_t)cbytes);
@@ -737,6 +804,8 @@ static int sec_decrypt(uint32_t ring_idx,
     const unsigned char *nonce = payload;
     const unsigned char *cipher = payload + nonce_bytes;
     unsigned long long pbytes = 0;
+    uint64_t t0 = 0;
+    if (g_ctx.stats_enabled) t0 = nowns();
     if (crypto_aead_chacha20poly1305_ietf_decrypt(out,
                                                   &pbytes,
                                                   NULL,
@@ -747,6 +816,10 @@ static int sec_decrypt(uint32_t ring_idx,
                                                   nonce,
                                                   g_ctx.sec_key[ring_idx]) != 0) {
         return C_ERR;
+    }
+    if (g_ctx.stats_enabled) {
+        stats_add(&g_ctx.stats_crypto_ns, nowns() - t0);
+        stats_add(&g_ctx.stats_crypto_out_bytes, pbytes);
     }
     if (pbytes > (unsigned long long)out_cap) return C_ERR;
     *out_len = (uint32_t)pbytes;
@@ -999,9 +1072,17 @@ static int tdx_ring_region_attach(void *base, size_t size, struct tdx_shm_region
 }
 
 static int queue_send(struct tdx_shm_queue_view *tx, uint32_t cid, uint16_t type, uint16_t flags, const unsigned char *payload, uint32_t len) {
+    uint64_t t0 = 0;
+    if (g_ctx.stats_enabled) t0 = nowns();
     cxl_shm_delay();
-    if (!tx || !tx->q || !tx->data || !payload) return C_ERR;
-    if (len > RING_MAX_PAYLOAD) return C_ERR;
+    if (!tx || !tx->q || !tx->data || !payload) {
+        if (g_ctx.stats_enabled) stats_add(&g_ctx.stats_ring_send_ns, nowns() - t0);
+        return C_ERR;
+    }
+    if (len > RING_MAX_PAYLOAD) {
+        if (g_ctx.stats_enabled) stats_add(&g_ctx.stats_ring_send_ns, nowns() - t0);
+        return C_ERR;
+    }
 
     struct tdx_shm_queue *q = tx->q;
     uint32_t cap = q->capacity;
@@ -1010,11 +1091,14 @@ static int queue_send(struct tdx_shm_queue_view *tx, uint32_t cid, uint16_t type
     uint32_t head = atomic_load_explicit(&q->head, memory_order_acquire);
     uint32_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
     uint32_t next = ring_next(tail, cap);
-    if (next == head) return 0; /* full */
+    if (next == head) {
+        if (g_ctx.stats_enabled) stats_add(&g_ctx.stats_ring_send_ns, nowns() - t0);
+        return 0; /* full */
+    }
 
     uint8_t *slot = tx->data + ((size_t)tail * q->slot_size);
     uint16_t msg_len = (uint16_t)(RING_SLOT_HDR_SIZE + len);
-    memcpy(slot, &msg_len, sizeof(msg_len));
+    memcpy_stats(slot, &msg_len, sizeof(msg_len));
 
     struct ring_slot_hdr hdr;
     hdr.cid = cid;
@@ -1022,16 +1106,22 @@ static int queue_send(struct tdx_shm_queue_view *tx, uint32_t cid, uint16_t type
     hdr.flags = flags;
     hdr.len = len;
     hdr.reserved = 0;
-    memcpy(slot + sizeof(msg_len), &hdr, sizeof(hdr));
-    if (len) memcpy(slot + sizeof(msg_len) + sizeof(hdr), payload, len);
+    memcpy_stats(slot + sizeof(msg_len), &hdr, sizeof(hdr));
+    if (len) memcpy_stats(slot + sizeof(msg_len) + sizeof(hdr), payload, len);
 
     atomic_store_explicit(&q->tail, next, memory_order_release);
+    if (g_ctx.stats_enabled) stats_add(&g_ctx.stats_ring_send_ns, nowns() - t0);
     return 1;
 }
 
 static int queue_recv(struct tdx_shm_queue_view *rx, uint32_t *cid, uint16_t *type, uint16_t *flags, unsigned char **payload, uint32_t *len) {
+    uint64_t t0 = 0;
+    if (g_ctx.stats_enabled) t0 = nowns();
     cxl_shm_delay();
-    if (!rx || !rx->q || !rx->data || !cid || !type || !flags || !payload || !len) return C_ERR;
+    if (!rx || !rx->q || !rx->data || !cid || !type || !flags || !payload || !len) {
+        if (g_ctx.stats_enabled) stats_add(&g_ctx.stats_ring_recv_ns, nowns() - t0);
+        return C_ERR;
+    }
 
     struct tdx_shm_queue *q = rx->q;
     uint32_t cap = q->capacity;
@@ -1039,15 +1129,18 @@ static int queue_recv(struct tdx_shm_queue_view *rx, uint32_t *cid, uint16_t *ty
 
     uint32_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
     uint32_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
-    if (head == tail) return 0; /* empty */
+    if (head == tail) {
+        if (g_ctx.stats_enabled) stats_add(&g_ctx.stats_ring_recv_ns, nowns() - t0);
+        return 0; /* empty */
+    }
 
     uint8_t *slot = rx->data + ((size_t)head * q->slot_size);
     uint16_t msg_len = 0;
-    memcpy(&msg_len, slot, sizeof(msg_len));
+    memcpy_stats(&msg_len, slot, sizeof(msg_len));
     if (msg_len < sizeof(struct ring_slot_hdr) || msg_len > TDX_SHM_MSG_MAX) return C_ERR;
 
     struct ring_slot_hdr hdr;
-    memcpy(&hdr, slot + sizeof(msg_len), sizeof(hdr));
+    memcpy_stats(&hdr, slot + sizeof(msg_len), sizeof(hdr));
     if (hdr.len > (uint32_t)(msg_len - sizeof(hdr))) return C_ERR;
     if (hdr.len > RING_MAX_PAYLOAD) return C_ERR;
 
@@ -1058,6 +1151,7 @@ static int queue_recv(struct tdx_shm_queue_view *rx, uint32_t *cid, uint16_t *ty
     *payload = slot + sizeof(msg_len) + sizeof(hdr);
 
     atomic_store_explicit(&q->head, ring_next(head, cap), memory_order_release);
+    if (g_ctx.stats_enabled) stats_add(&g_ctx.stats_ring_recv_ns, nowns() - t0);
     return 1;
 }
 
@@ -1097,7 +1191,7 @@ static int send_binary_resp(int ring_idx, uint32_t cid, uint8_t status, const un
     buf[1] = (uint8_t)(vlen & 0xff);
     buf[2] = (uint8_t)((vlen >> 8) & 0xff);
     buf[3] = 0;
-    if (vlen) memcpy(buf + 4, val, vlen);
+    if (vlen) memcpy_stats(buf + 4, val, vlen);
     return send_binary_payload(ring_idx, cid, buf, (uint32_t)(4U + (uint32_t)vlen));
 }
 
@@ -1130,7 +1224,7 @@ static void scan_collect_cb(void *privdata, const dictEntry *de, dictEntry **pli
     }
     sc->buf[sc->off] = (uint8_t)(vlen & 0xff);
     sc->buf[sc->off + 1] = (uint8_t)((vlen >> 8) & 0xff);
-    memcpy(sc->buf + sc->off + 2, dec->ptr, vlen);
+    memcpy_stats(sc->buf + sc->off + 2, dec->ptr, vlen);
     sc->off += need;
     sc->count++;
     decrRefCount(dec);
@@ -1148,7 +1242,7 @@ static int send_scan_resp(int ring_idx, uint32_t cid, uint8_t status, uint16_t c
     for (int i = 0; i < 8; i++) {
         buf[4 + i] = (uint8_t)((next_cursor >> (8 * i)) & 0xff);
     }
-    if (vals_len && vals) memcpy(buf + header_len, vals, vals_len);
+    if (vals_len && vals) memcpy_stats(buf + header_len, vals, vals_len);
     return send_binary_payload(ring_idx, cid, buf, (uint32_t)(header_len + vals_len));
 }
 
@@ -1434,6 +1528,12 @@ int cxlRingInitFromEnv(void) {
         return C_ERR;
     }
 
+    const char *stats_out = getenv("CXL_RING_STATS_OUT");
+    if (stats_out && stats_out[0]) {
+        snprintf(g_ctx.stats_path, sizeof(g_ctx.stats_path), "%s", stats_out);
+        g_ctx.stats_enabled = 1;
+    }
+
     g_ctx.enabled = 1;
     if (!g_ctx.timer_id) {
         g_ctx.timer_id = aeCreateTimeEvent(server.el, 1, cxlRingCron, NULL, NULL);
@@ -1495,6 +1595,7 @@ static int cxlRingCron(aeEventLoop *eventLoop, long long id, void *clientData) {
 
 void cxlRingShutdown(void) {
     if (!g_ctx.enabled) return;
+    cxl_ring_write_stats();
     if (g_ctx.timer_id > 0 && server.el) {
         aeDeleteTimeEvent(server.el, g_ctx.timer_id);
     }
