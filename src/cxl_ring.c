@@ -151,6 +151,7 @@ typedef struct {
 
     int secure_enabled;
     int crypto_enabled; /* manager-less crypto mode (vm key + common key) */
+    int crypto_payload_only; /* payload-only crypto (no private staging) */
     uint64_t sec_node_id;
     unsigned sec_timeout_ms;
     char sec_mgr[256];
@@ -594,6 +595,7 @@ static int crypto_priv_encrypt_then_decrypt(uint32_t ring_idx,
 static int cxl_sec_init(void) {
     g_ctx.secure_enabled = env_enabled("CXL_SEC_ENABLE");
     if (!g_ctx.secure_enabled) return C_OK;
+    g_ctx.crypto_payload_only = env_enabled("CXL_CRYPTO_PAYLOAD_ONLY");
 
     if (sodium_init() < 0) {
         serverLog(LL_WARNING, "cxl_sec: sodium_init failed");
@@ -643,8 +645,12 @@ static int cxl_sec_init(void) {
             g_ctx.sec_key_ok[i] = 1;
             atomic_store_explicit(&g_ctx.sec_nonce_ctr_resp[i], 0, memory_order_relaxed);
         }
-        if (crypto_priv_init() != C_OK) return C_ERR;
-        serverLog(LL_NOTICE, "cxl_crypto: enabled (node_id=%llu)", (unsigned long long)g_ctx.sec_node_id);
+        if (!g_ctx.crypto_payload_only) {
+            if (crypto_priv_init() != C_OK) return C_ERR;
+            serverLog(LL_NOTICE, "cxl_crypto: enabled (node_id=%llu)", (unsigned long long)g_ctx.sec_node_id);
+        } else {
+            serverLog(LL_NOTICE, "cxl_crypto: payload-only enabled (node_id=%llu)", (unsigned long long)g_ctx.sec_node_id);
+        }
         return C_OK;
     }
 
@@ -944,7 +950,7 @@ static int resp_send_chunk(int ring_idx, uint32_t cid, const unsigned char *payl
     const unsigned char *plain = payload;
     unsigned char staged[RING_MAX_PAYLOAD];
     uint32_t staged_len = 0;
-    if (g_ctx.crypto_enabled) {
+    if (g_ctx.crypto_enabled && !g_ctx.crypto_payload_only) {
         if (crypto_priv_encrypt_then_decrypt((uint32_t)ring_idx,
                                              SEC_DIR_RESP,
                                              payload,
@@ -1165,7 +1171,7 @@ static int send_binary_payload(int ring_idx, uint32_t cid, const unsigned char *
     const unsigned char *payload = plain;
     unsigned char staged[RING_MAX_PAYLOAD];
     uint32_t staged_len = 0;
-    if (g_ctx.crypto_enabled) {
+    if (g_ctx.crypto_enabled && !g_ctx.crypto_payload_only) {
         if (crypto_priv_encrypt_then_decrypt((uint32_t)ring_idx,
                                              SEC_DIR_RESP,
                                              plain,
