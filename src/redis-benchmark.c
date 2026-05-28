@@ -17,10 +17,16 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <limits.h>
 #include <signal.h>
 #include <assert.h>
 #include <math.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <strings.h>
 
 #include <sdscompat.h> /* Use hiredis' sds compat header that maps sds calls to their hi_ variants */
 #include <sds.h> /* Use hiredis sds. */
@@ -39,6 +45,7 @@
 #include "hdr_histogram.h"
 #include "cli_common.h"
 #include "mt19937-64.h"
+#include "cxl_ring.h"
 
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
@@ -50,9 +57,81 @@
 #define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE 3000000L          /* <= 3 secs(us precision) */
 #define CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE 3000000L   /* <= 3 secs(us precision) */
 #define SHOW_THROUGHPUT_INTERVAL 250  /* 250ms */
+#define CXL_BENCH_DEFAULT_MAP_SIZE (1024ULL * 1024ULL * 1024ULL)
+#define CXL_BENCH_ATTACH_TIMEOUT_US (30LL * 1000LL * 1000LL)
+#define CXL_BENCH_ATTACH_MAX_TRIES 10000000
+#ifndef C_OK
+#define C_OK 0
+#define C_ERR -1
+#endif
 
 #define CLIENT_GET_EVENTLOOP(c) \
     (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
+
+static int cxlBenchDebugEnabled(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        const char *value = getenv("CXL_BENCH_DEBUG");
+        enabled = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int redisGem5SeDontWaitEnabled(void) {
+    const char *value = getenv("REDIS_GEM5_SE_DONT_WAIT");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+#define CXL_BENCH_DEBUGF(...) do { \
+    if (cxlBenchDebugEnabled()) { \
+        fprintf(stderr, __VA_ARGS__); \
+        fflush(stderr); \
+    } \
+} while (0)
+
+enum {
+    CXL_BENCH_MODE_NATIVE_SHM = 0,
+    CXL_BENCH_MODE_DSM_TEE = 1
+};
+
+enum {
+    CXL_YCSB_WORKLOAD_A = 0,
+    CXL_YCSB_WORKLOAD_B,
+    CXL_YCSB_WORKLOAD_C,
+    CXL_YCSB_WORKLOAD_D,
+    CXL_YCSB_WORKLOAD_E,
+    CXL_YCSB_WORKLOAD_F
+};
+
+enum {
+    CXL_YCSB_PHASE_LOAD = 0,
+    CXL_YCSB_PHASE_RUN,
+    CXL_YCSB_PHASE_LOAD_RUN
+};
+
+enum {
+    CXL_YCSB_DIST_AUTO = 0,
+    CXL_YCSB_DIST_UNIFORM,
+    CXL_YCSB_DIST_ZIPFIAN,
+    CXL_YCSB_DIST_LATEST
+};
+
+enum {
+    YCSB_TRANSPORT_AUTO = 0,
+    YCSB_TRANSPORT_TCP,
+    YCSB_TRANSPORT_CXL
+};
+
+enum {
+    CXL_YCSB_OP_READ = 0,
+    CXL_YCSB_OP_UPDATE,
+    CXL_YCSB_OP_INSERT,
+    CXL_YCSB_OP_SCAN,
+    CXL_YCSB_OP_RMW,
+    CXL_YCSB_OP_MAX
+};
 
 struct benchmarkThread;
 struct clusterNode;
@@ -74,6 +153,7 @@ static struct config {
     long long previous_tick;
     int keysize;
     int datasize;
+    int datasize_set;
     int randomkeys;
     int randomkeys_keyspacelen;
     int keepalive;
@@ -91,6 +171,7 @@ static struct config {
     int stdinarg; /* get last arg from stdin. (-x option) */
     int precision;
     int num_threads;
+    int threads_use_main;
     struct benchmarkThread **threads;
     int cluster_mode;
     int cluster_node_count;
@@ -105,6 +186,39 @@ static struct config {
     pthread_mutex_t liveclients_mutex;
     pthread_mutex_t is_updating_slots_mutex;
     int resp3; /* use RESP3 */
+    int cxl_enabled;
+    int cxl_mode;
+    int cxl_paper_preset;
+    char *cxl_ring_path;
+    size_t cxl_ring_map_size;
+    size_t cxl_ring_offset;
+    size_t cxl_ring_region_base;
+    size_t cxl_ring_region_size;
+    int cxl_ring_count;
+    int ycsb_enabled;
+    int ycsb_transport;
+    int ycsb_workload;
+    int ycsb_phase;
+    unsigned long long ycsb_record_count;
+    unsigned long long ycsb_operation_count;
+    unsigned long long ycsb_insert_start;
+    int ycsb_insert_start_set;
+    int ycsb_request_distribution;
+    int ycsb_scan_length_distribution;
+    int ycsb_max_scan_length;
+    int ycsb_field_count;
+    int ycsb_field_length;
+    int ycsb_read_all_fields;
+    unsigned long long ycsb_seed;
+    char *ycsb_key_prefix;
+    int ycsb_key_width;
+    double ycsb_zipf_theta;
+    int server_ready_timeout_ms;
+    int gem5_client_id;
+    int gem5_client_count;
+    int gem5_client_sync_timeout_ms;
+    int shutdown_server_after;
+    char *gem5_client_sync_dir;
 } config;
 
 typedef struct _client {
@@ -178,6 +292,13 @@ static redisContext *getRedisContext(const char *ip, int port,
 static void freeRedisConfig(redisConfig *cfg);
 static int fetchClusterSlotsConfiguration(client c);
 static void updateClusterSlotsConfiguration(void);
+static int cxlBenchParseSize(const char *arg, size_t *out);
+static int cxlBenchParseMode(const char *mode);
+static int cxlYcsbParseWorkload(const char *workload);
+static int cxlYcsbParsePhase(const char *phase);
+static int cxlYcsbParseDistribution(const char *dist, int allow_latest);
+static int cxlYcsbParseUInt64(const char *arg, unsigned long long *out);
+static int cxlBenchmarkMain(int argc, char **argv);
 int showThroughput(struct aeEventLoop *eventLoop, long long id,
                    void *clientData);
 
@@ -220,13 +341,31 @@ static redisContext *getRedisContext(const char *ip, int port,
 {
     redisContext *ctx = NULL;
     redisReply *reply =  NULL;
-    if (hostsocket == NULL)
-        ctx = redisConnect(ip, port);
-    else
-        ctx = redisConnectUnix(hostsocket);
+    char last_err[256] = "";
+    long long deadline = ustime() +
+        (long long)config.server_ready_timeout_ms * 1000LL;
+
+    while (1) {
+        if (hostsocket == NULL)
+            ctx = redisConnect(ip, port);
+        else
+            ctx = redisConnectUnix(hostsocket);
+        if (ctx != NULL && !ctx->err) break;
+
+        snprintf(last_err, sizeof(last_err), "%s",
+                 ctx != NULL ? ctx->errstr : "");
+        if (ctx != NULL) {
+            redisFree(ctx);
+            ctx = NULL;
+        }
+        if (config.server_ready_timeout_ms <= 0 || ustime() >= deadline)
+            break;
+        sched_yield();
+    }
+
     if (ctx == NULL || ctx->err) {
         fprintf(stderr,"Could not connect to Redis at ");
-        char *err = (ctx != NULL ? ctx->errstr : "");
+        char *err = (ctx != NULL ? ctx->errstr : last_err);
         if (hostsocket == NULL)
             fprintf(stderr,"%s:%d: %s\n",ip,port,err);
         else
@@ -266,7 +405,7 @@ static redisContext *getRedisContext(const char *ip, int port,
         fprintf(stderr, "%s\n", hostsocket);
 cleanup:
     freeReplyObject(reply);
-    redisFree(ctx);
+    if (ctx != NULL) redisFree(ctx);
     return NULL;
 }
 
@@ -932,14 +1071,17 @@ static void initBenchmarkThreads(void) {
 
 static void startBenchmarkThreads(void) {
     int i;
-    for (i = 0; i < config.num_threads; i++) {
+    int first_pthread = config.threads_use_main ? 1 : 0;
+    for (i = first_pthread; i < config.num_threads; i++) {
         benchmarkThread *t = config.threads[i];
         if (pthread_create(&(t->thread), NULL, execBenchmarkThread, t)){
             fprintf(stderr, "FATAL: Failed to start thread %d.\n", i);
             exit(1);
         }
     }
-    for (i = 0; i < config.num_threads; i++)
+    if (config.threads_use_main && config.num_threads > 0)
+        execBenchmarkThread(config.threads[0]);
+    for (i = first_pthread; i < config.num_threads; i++)
         pthread_join(config.threads[i]->thread, NULL);
 }
 
@@ -988,6 +1130,8 @@ static benchmarkThread *createBenchmarkThread(int index) {
     if (thread == NULL) return NULL;
     thread->index = index;
     thread->el = aeCreateEventLoop(1024*10);
+    if (redisGem5SeDontWaitEnabled())
+        aeSetDontWait(thread->el, 1);
     aeCreateTimeEvent(thread->el,1,showThroughput,(void *)thread,NULL);
     return thread;
 }
@@ -1429,10 +1573,168 @@ int parseOptions(int argc, char **argv) {
             config.datasize = atoi(argv[++i]);
             if (config.datasize < 1) config.datasize=1;
             if (config.datasize > 1024*1024*1024) config.datasize = 1024*1024*1024;
+            config.datasize_set = 1;
         } else if (!strcmp(argv[i],"-P")) {
             if (lastarg) goto invalid;
             config.pipeline = atoi(argv[++i]);
             if (config.pipeline <= 0) config.pipeline=1;
+        } else if (!strcmp(argv[i],"--cxl-ring")) {
+            if (lastarg) goto invalid;
+            config.cxl_enabled = 1;
+            config.cxl_ring_path = strdup(argv[++i]);
+        } else if (!strcmp(argv[i],"--cxl-mode")) {
+            if (lastarg) goto invalid;
+            config.cxl_enabled = 1;
+            if (cxlBenchParseMode(argv[++i]) != C_OK) goto invalid;
+        } else if (!strcmp(argv[i],"--cxl-ring-map-size")) {
+            if (lastarg) goto invalid;
+            config.cxl_enabled = 1;
+            if (cxlBenchParseSize(argv[++i], &config.cxl_ring_map_size) != C_OK)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--cxl-ring-offset")) {
+            if (lastarg) goto invalid;
+            config.cxl_enabled = 1;
+            if (cxlBenchParseSize(argv[++i], &config.cxl_ring_offset) != C_OK)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--cxl-ring-region-base")) {
+            if (lastarg) goto invalid;
+            config.cxl_enabled = 1;
+            if (cxlBenchParseSize(argv[++i], &config.cxl_ring_region_base) != C_OK)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--cxl-ring-region-size")) {
+            if (lastarg) goto invalid;
+            config.cxl_enabled = 1;
+            if (cxlBenchParseSize(argv[++i], &config.cxl_ring_region_size) != C_OK)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--cxl-ring-count")) {
+            if (lastarg) goto invalid;
+            config.cxl_enabled = 1;
+            config.cxl_ring_count = atoi(argv[++i]);
+            if (config.cxl_ring_count <= 0 || config.cxl_ring_count > MAX_THREADS)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--cxl-paper-redis")) {
+            config.cxl_enabled = 1;
+            config.cxl_paper_preset = 1;
+            config.requests = 2000000;
+            config.pipeline = 256;
+            if (config.tests == NULL)
+                config.tests = sdsnew(",set,get,");
+        } else if (!strcmp(argv[i],"--ycsb")) {
+            config.ycsb_enabled = 1;
+        } else if (!strcmp(argv[i],"--ycsb-transport")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            char *transport = argv[++i];
+            if (!strcasecmp(transport, "tcp")) {
+                config.ycsb_transport = YCSB_TRANSPORT_TCP;
+            } else if (!strcasecmp(transport, "cxl")) {
+                config.ycsb_transport = YCSB_TRANSPORT_CXL;
+                config.cxl_enabled = 1;
+            } else {
+                goto invalid;
+            }
+        } else if (!strcmp(argv[i],"--ycsb-workload")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            if (cxlYcsbParseWorkload(argv[++i]) != C_OK) goto invalid;
+        } else if (!strcmp(argv[i],"--ycsb-phase")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            if (cxlYcsbParsePhase(argv[++i]) != C_OK) goto invalid;
+        } else if (!strcmp(argv[i],"--ycsb-record-count")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            if (cxlYcsbParseUInt64(argv[++i],
+                                   &config.ycsb_record_count) != C_OK)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--ycsb-operation-count")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            if (cxlYcsbParseUInt64(argv[++i],
+                                   &config.ycsb_operation_count) != C_OK)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--ycsb-insert-start")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            if (cxlYcsbParseUInt64(argv[++i],
+                                   &config.ycsb_insert_start) != C_OK)
+                goto invalid;
+            config.ycsb_insert_start_set = 1;
+        } else if (!strcmp(argv[i],"--ycsb-request-distribution")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            int dist = cxlYcsbParseDistribution(argv[++i], 1);
+            if (dist == C_ERR) goto invalid;
+            config.ycsb_request_distribution = dist;
+        } else if (!strcmp(argv[i],"--ycsb-scan-length-distribution")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            int dist = cxlYcsbParseDistribution(argv[++i], 0);
+            if (dist == C_ERR) goto invalid;
+            config.ycsb_scan_length_distribution = dist;
+        } else if (!strcmp(argv[i],"--ycsb-max-scan-length")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            config.ycsb_max_scan_length = atoi(argv[++i]);
+            if (config.ycsb_max_scan_length <= 0 ||
+                config.ycsb_max_scan_length > UINT16_MAX)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--ycsb-field-count")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            config.ycsb_field_count = atoi(argv[++i]);
+            if (config.ycsb_field_count <= 0) goto invalid;
+        } else if (!strcmp(argv[i],"--ycsb-field-length")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            config.ycsb_field_length = atoi(argv[++i]);
+            if (config.ycsb_field_length <= 0) goto invalid;
+        } else if (!strcmp(argv[i],"--ycsb-read-all-fields")) {
+            config.ycsb_enabled = 1;
+            config.ycsb_read_all_fields = 1;
+        } else if (!strcmp(argv[i],"--ycsb-seed")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            if (cxlYcsbParseUInt64(argv[++i], &config.ycsb_seed) != C_OK)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--ycsb-key-prefix")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            config.ycsb_key_prefix = strdup(argv[++i]);
+        } else if (!strcmp(argv[i],"--ycsb-key-width")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            config.ycsb_key_width = atoi(argv[++i]);
+            if (config.ycsb_key_width <= 0 || config.ycsb_key_width > 40)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--ycsb-zipf-theta")) {
+            if (lastarg) goto invalid;
+            config.ycsb_enabled = 1;
+            config.ycsb_zipf_theta = strtod(argv[++i], NULL);
+            if (config.ycsb_zipf_theta <= 0.0 ||
+                config.ycsb_zipf_theta >= 1.0)
+                goto invalid;
+        } else if (!strcmp(argv[i],"--server-ready-timeout-ms")) {
+            if (lastarg) goto invalid;
+            config.server_ready_timeout_ms = atoi(argv[++i]);
+            if (config.server_ready_timeout_ms < 0) goto invalid;
+        } else if (!strcmp(argv[i],"--gem5-client-id")) {
+            if (lastarg) goto invalid;
+            config.gem5_client_id = atoi(argv[++i]);
+            if (config.gem5_client_id < 0) goto invalid;
+        } else if (!strcmp(argv[i],"--gem5-client-count")) {
+            if (lastarg) goto invalid;
+            config.gem5_client_count = atoi(argv[++i]);
+            if (config.gem5_client_count < 0) goto invalid;
+        } else if (!strcmp(argv[i],"--gem5-client-sync-dir")) {
+            if (lastarg) goto invalid;
+            config.gem5_client_sync_dir = strdup(argv[++i]);
+        } else if (!strcmp(argv[i],"--gem5-client-sync-timeout-ms")) {
+            if (lastarg) goto invalid;
+            config.gem5_client_sync_timeout_ms = atoi(argv[++i]);
+            if (config.gem5_client_sync_timeout_ms < 0) goto invalid;
+        } else if (!strcmp(argv[i],"--shutdown-server-after")) {
+            config.shutdown_server_after = 1;
         } else if (!strcmp(argv[i],"-r")) {
             if (lastarg) goto invalid;
             const char *next = argv[++i], *p = next;
@@ -1490,6 +1792,8 @@ int parseOptions(int argc, char **argv) {
                          MAX_THREADS);
                 config.num_threads = MAX_THREADS;
              } else if (config.num_threads < 0) config.num_threads = 0;
+        } else if (!strcmp(argv[i],"--threads-use-main")) {
+            config.threads_use_main = 1;
         } else if (!strcmp(argv[i],"--cluster")) {
             config.cluster_mode = 1;
         } else if (!strcmp(argv[i],"--enable-tracking")) {
@@ -1565,7 +1869,7 @@ usage:
 "";
 
     printf(
-"%s%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
+"%s%s%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
 "Usage: redis-benchmark [OPTIONS] [COMMAND ARGS...]\n\n"
 "Options:\n"
 " -h <hostname>      Server hostname (default 127.0.0.1)\n"
@@ -1585,6 +1889,7 @@ usage:
 " --dbnum <db>       SELECT the specified db number (default 0)\n"
 " -3                 Start session in RESP3 protocol mode.\n"
 " --threads <num>    Enable multi-thread mode.\n"
+" --threads-use-main Count the main thread as one benchmark worker.\n"
 " --cluster          Enable cluster mode.\n"
 "                    If the command is supplied on the command line in cluster\n"
 "                    mode, the key must contain \"{tag}\". Otherwise, the\n"
@@ -1602,6 +1907,28 @@ usage:
 "                    Note: If -r is omitted, all commands in a benchmark will\n"
 "                    use the same key.\n"
 " -P <numreq>        Pipeline <numreq> requests. Default 1 (no pipeline).\n"
+" --cxl-ring <path>  Use CXL shared-memory ring instead of TCP for GET/SET.\n"
+" --cxl-mode <mode>  native-shm or dsm-tee. Default native-shm.\n"
+" --cxl-ring-count <n> Number of shared-memory rings; use >= --threads.\n"
+" --cxl-ring-map-size <bytes> Shared mapping size, supports K/M/G suffixes.\n"
+" --cxl-paper-redis  Preset paper redis-benchmark config: -n 2000000 -P 256 -t set,get.\n",
+" --ycsb             Enable built-in YCSB mode.\n"
+" --ycsb-transport <tcp|cxl> YCSB transport. Default tcp unless --cxl-ring is set.\n"
+" --ycsb-workload <a|b|c|d|e|f> YCSB Core Workload to run.\n"
+" --ycsb-phase <load|run|load-run> Load records, run operations, or both.\n"
+" --ycsb-record-count <n> Number of records in the initial database.\n"
+" --ycsb-operation-count <n> Number of YCSB run-phase operations.\n"
+" --ycsb-request-distribution <uniform|zipfian|latest> Key distribution.\n"
+" --ycsb-scan-length-distribution <uniform|zipfian> Scan length distribution.\n"
+" --ycsb-max-scan-length <n> Maximum Workload E scan length, default 100.\n"
+" --ycsb-field-count <n> Number of fields per record, default 10.\n"
+" --ycsb-field-length <n> Bytes per field, default 100.\n"
+" --ycsb-key-prefix <str> Key prefix, default user.\n"
+" --server-ready-timeout-ms <ms> Retry initial TCP connection until timeout.\n"
+" --shutdown-server-after Send SHUTDOWN NOSAVE after benchmark completion.\n"
+" --gem5-client-id <n> Client id used with --shutdown-server-after coordination.\n"
+" --gem5-client-count <n> Number of client processes in the coordinated run.\n"
+" --gem5-client-sync-dir <path> Directory for coordinated client completion files.\n"
 " -q                 Quiet. Just show query/sec values\n"
 " --precision        Number of decimal places to display in latency output (default 0)\n"
 " --csv              Output in CSV format\n"
@@ -1693,6 +2020,1407 @@ int test_is_selected(const char *name) {
     return strstr(config.tests,buf) != NULL;
 }
 
+typedef struct cxlBenchCtx {
+    int fd;
+    uint8_t *mm;
+    size_t map_size;
+    size_t map_offset;
+    int ring_count;
+    size_t region_base;
+    size_t region_size;
+    struct cxl_ring_region *rings;
+    volatile int errors;
+    volatile int issued;
+    volatile int finished;
+    long long start_us;
+    long long end_us;
+    long long total_latency_us;
+    long long *latencies_us;
+    char *value;
+    int value_len;
+    int op;
+    int ycsb_target_ops;
+    int ycsb_load_phase;
+    volatile unsigned long long ycsb_next_insert_id;
+    volatile long long ycsb_cxl_gets;
+    volatile long long ycsb_cxl_sets;
+    volatile long long ycsb_cxl_scans;
+} cxlBenchCtx;
+
+typedef struct cxlBenchThreadArg {
+    cxlBenchCtx *ctx;
+    int index;
+} cxlBenchThreadArg;
+
+typedef struct cxlYcsbZipf {
+    unsigned long long items;
+    double theta;
+    double zeta2theta;
+    double alpha;
+    double zetan;
+    double eta;
+} cxlYcsbZipf;
+
+typedef struct cxlYcsbOpStats {
+    volatile int count;
+    volatile long long total_latency_us;
+    long long *latencies_us;
+} cxlYcsbOpStats;
+
+typedef struct cxlYcsbPending {
+    int logical_op;
+    unsigned long long key_id;
+    uint16_t scan_len;
+    long long start_us;
+} cxlYcsbPending;
+
+static cxlYcsbOpStats ycsb_stats[CXL_YCSB_OP_MAX];
+static cxlYcsbZipf ycsb_key_zipf;
+static cxlYcsbZipf ycsb_scan_zipf;
+
+static int cxlBenchParseSize(const char *arg, size_t *out) {
+    if (!arg || !out || !arg[0]) return C_ERR;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(arg, &end, 0);
+    if (errno != 0 || end == arg) return C_ERR;
+
+    unsigned long long multiplier = 1ULL;
+    if (end && *end != '\0') {
+        if (end[1] != '\0' &&
+            !((end[1] == 'B' || end[1] == 'b') && end[2] == '\0') &&
+            !((end[1] == 'I' || end[1] == 'i') &&
+              (end[2] == 'B' || end[2] == 'b') && end[3] == '\0'))
+            return C_ERR;
+        switch (*end) {
+        case 'K':
+        case 'k':
+            multiplier = 1024ULL;
+            break;
+        case 'M':
+        case 'm':
+            multiplier = 1024ULL * 1024ULL;
+            break;
+        case 'G':
+        case 'g':
+            multiplier = 1024ULL * 1024ULL * 1024ULL;
+            break;
+        default:
+            return C_ERR;
+        }
+    }
+    if (value > ULLONG_MAX / multiplier) return C_ERR;
+    unsigned long long bytes = value * multiplier;
+    if (bytes > (unsigned long long)SIZE_MAX) return C_ERR;
+    *out = (size_t)bytes;
+    return C_OK;
+}
+
+static int cxlYcsbParseUInt64(const char *arg, unsigned long long *out) {
+    if (!arg || !arg[0] || !out) return C_ERR;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(arg, &end, 10);
+    if (errno != 0 || end == arg || *end != '\0') return C_ERR;
+    *out = value;
+    return C_OK;
+}
+
+static int cxlYcsbParseWorkload(const char *workload) {
+    if (!workload || !workload[0]) return C_ERR;
+    if (!strcasecmp(workload, "a") || !strcasecmp(workload, "workloada")) {
+        config.ycsb_workload = CXL_YCSB_WORKLOAD_A;
+        return C_OK;
+    }
+    if (!strcasecmp(workload, "b") || !strcasecmp(workload, "workloadb")) {
+        config.ycsb_workload = CXL_YCSB_WORKLOAD_B;
+        return C_OK;
+    }
+    if (!strcasecmp(workload, "c") || !strcasecmp(workload, "workloadc")) {
+        config.ycsb_workload = CXL_YCSB_WORKLOAD_C;
+        return C_OK;
+    }
+    if (!strcasecmp(workload, "d") || !strcasecmp(workload, "workloadd")) {
+        config.ycsb_workload = CXL_YCSB_WORKLOAD_D;
+        return C_OK;
+    }
+    if (!strcasecmp(workload, "e") || !strcasecmp(workload, "workloade")) {
+        config.ycsb_workload = CXL_YCSB_WORKLOAD_E;
+        return C_OK;
+    }
+    if (!strcasecmp(workload, "f") || !strcasecmp(workload, "workloadf")) {
+        config.ycsb_workload = CXL_YCSB_WORKLOAD_F;
+        return C_OK;
+    }
+    return C_ERR;
+}
+
+static int cxlYcsbParsePhase(const char *phase) {
+    if (!phase || !phase[0]) return C_ERR;
+    if (!strcasecmp(phase, "load")) {
+        config.ycsb_phase = CXL_YCSB_PHASE_LOAD;
+        return C_OK;
+    }
+    if (!strcasecmp(phase, "run")) {
+        config.ycsb_phase = CXL_YCSB_PHASE_RUN;
+        return C_OK;
+    }
+    if (!strcasecmp(phase, "load-run") || !strcasecmp(phase, "loadrun")) {
+        config.ycsb_phase = CXL_YCSB_PHASE_LOAD_RUN;
+        return C_OK;
+    }
+    return C_ERR;
+}
+
+static int cxlYcsbParseDistribution(const char *dist, int allow_latest) {
+    if (!dist || !dist[0]) return C_ERR;
+    if (!strcasecmp(dist, "uniform")) return CXL_YCSB_DIST_UNIFORM;
+    if (!strcasecmp(dist, "zipfian")) return CXL_YCSB_DIST_ZIPFIAN;
+    if (allow_latest && !strcasecmp(dist, "latest"))
+        return CXL_YCSB_DIST_LATEST;
+    return C_ERR;
+}
+
+static const char *cxlBenchModeName(void) {
+    switch (config.cxl_mode) {
+    case CXL_BENCH_MODE_DSM_TEE:
+        return "DSM-TEE";
+    default:
+        return "NativeShm";
+    }
+}
+
+static const char *cxlBenchDefaultPath(void) {
+    if (config.cxl_ring_path) return config.cxl_ring_path;
+    if (config.cxl_mode == CXL_BENCH_MODE_DSM_TEE) return "/dev/gem5_dsm_tee";
+    return "/dev/gem5_cxl_mem";
+}
+
+static int cxlBenchParseMode(const char *mode) {
+    if (!strcasecmp(mode, "native-shm") || !strcasecmp(mode, "nativeshm")) {
+        config.cxl_mode = CXL_BENCH_MODE_NATIVE_SHM;
+        return C_OK;
+    }
+    if (!strcasecmp(mode, "dsm-tee") || !strcasecmp(mode, "dsmtee")) {
+        config.cxl_mode = CXL_BENCH_MODE_DSM_TEE;
+        return C_OK;
+    }
+    return C_ERR;
+}
+
+static int cxlBenchWaitAttachRegion(void *base, size_t size,
+                                    struct cxl_ring_region *region) {
+    long long deadline = ustime() + CXL_BENCH_ATTACH_TIMEOUT_US;
+
+    for (int tries = 0; tries < CXL_BENCH_ATTACH_MAX_TRIES; tries++) {
+        if (cxlRingRegionAttach(base, size, region) == 0 &&
+            cxlRingRegionIsReady(region)) {
+            CXL_BENCH_DEBUGF("CXL benchmark: attached ready ring base=%p size=%zu tries=%d\n",
+                             base, size, tries);
+            return C_OK;
+        }
+
+        if (tries > 1024 && ustime() >= deadline)
+            break;
+        sched_yield();
+    }
+    CXL_BENCH_DEBUGF("CXL benchmark: attach timeout base=%p size=%zu\n",
+                     base, size);
+    return C_ERR;
+}
+
+static int cxlBenchOpenAndMap(cxlBenchCtx *ctx) {
+    const char *path = cxlBenchDefaultPath();
+    CXL_BENCH_DEBUGF("CXL benchmark: open path=%s map_size=%zu offset=%zu base=%zu region_size=%zu rings=%d\n",
+                     path, ctx->map_size, ctx->map_offset, ctx->region_base,
+                     ctx->region_size, ctx->ring_count);
+    ctx->fd = open(path, O_RDWR);
+    if (ctx->fd < 0 && errno == ENOENT && strncmp(path, "/dev/", 5) != 0)
+        ctx->fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (ctx->fd < 0) {
+        fprintf(stderr, "CXL benchmark: open(%s) failed: %s\n", path, strerror(errno));
+        return C_ERR;
+    }
+
+    struct stat st;
+    int have_stat = fstat(ctx->fd, &st) == 0;
+    if (!have_stat && strncmp(path, "/dev/", 5) != 0) {
+        fprintf(stderr, "CXL benchmark: fstat failed: %s\n", strerror(errno));
+        close(ctx->fd);
+        ctx->fd = -1;
+        return C_ERR;
+    }
+    if (have_stat && S_ISREG(st.st_mode)) {
+        off_t needed = (off_t)(ctx->map_offset + ctx->map_size);
+        if (st.st_size < needed && ftruncate(ctx->fd, needed) != 0) {
+            fprintf(stderr, "CXL benchmark: ftruncate failed: %s\n", strerror(errno));
+            close(ctx->fd);
+            ctx->fd = -1;
+            return C_ERR;
+        }
+    }
+
+    ctx->mm = mmap(NULL, ctx->map_size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, ctx->fd, (off_t)ctx->map_offset);
+    if (ctx->mm == MAP_FAILED) {
+        fprintf(stderr, "CXL benchmark: mmap failed: %s\n", strerror(errno));
+        close(ctx->fd);
+        ctx->fd = -1;
+        ctx->mm = NULL;
+        return C_ERR;
+    }
+    CXL_BENCH_DEBUGF("CXL benchmark: mapped mm=%p\n", ctx->mm);
+
+    ctx->rings = zmalloc(sizeof(*ctx->rings) * ctx->ring_count);
+    for (int i = 0; i < ctx->ring_count; i++) {
+        size_t off = ctx->region_base + (size_t)i * ctx->region_size;
+        if (off > ctx->map_size || ctx->region_size > ctx->map_size - off) {
+            fprintf(stderr, "CXL benchmark: ring %d is out of mapped range\n", i);
+            return C_ERR;
+        }
+        void *base = ctx->mm + off;
+        if (cxlBenchWaitAttachRegion(base, ctx->region_size,
+                                     &ctx->rings[i]) != C_OK) {
+            fprintf(stderr,
+                    "CXL benchmark: ring %d attach timed out waiting for server readiness\n",
+                    i);
+            return C_ERR;
+        }
+        CXL_BENCH_DEBUGF("CXL benchmark: ring %d attached off=%zu flags=%#x\n",
+                         i, off,
+                         __atomic_load_n(&ctx->rings[i].hdr->flags,
+                                         __ATOMIC_ACQUIRE));
+    }
+    return C_OK;
+}
+
+static void cxlBenchClose(cxlBenchCtx *ctx) {
+    if (ctx->mm && ctx->mm != MAP_FAILED) munmap(ctx->mm, ctx->map_size);
+    if (ctx->fd >= 0) close(ctx->fd);
+    if (ctx->rings) zfree(ctx->rings);
+    if (ctx->latencies_us) zfree(ctx->latencies_us);
+    if (ctx->value) zfree(ctx->value);
+}
+
+static int cxlBenchBuildRawRequest(int op, const char *key, int key_len,
+                                   const char *value, uint16_t value_len,
+                                   uint8_t *buf, uint32_t *len_out) {
+    if (!key || key_len <= 0 || key_len > 255 || !buf || !len_out)
+        return C_ERR;
+    if (op == CXL_OP_SET && value_len != 0U && value == NULL)
+        return C_ERR;
+    if (op != CXL_OP_SET && value != NULL)
+        return C_ERR;
+
+    uint32_t payload_value_len = op == CXL_OP_SET ? value_len : 0U;
+    uint32_t need = 4U + (uint32_t)key_len + payload_value_len;
+    if (need > CXL_RING_MAX_PAYLOAD) return C_ERR;
+
+    buf[0] = (uint8_t)op;
+    buf[1] = (uint8_t)key_len;
+    buf[2] = (uint8_t)(value_len & 0xffU);
+    buf[3] = (uint8_t)((value_len >> 8) & 0xffU);
+    memcpy(buf + 4U, key, key_len);
+    if (payload_value_len != 0U)
+        memcpy(buf + 4U + key_len, value, payload_value_len);
+    *len_out = need;
+    return C_OK;
+}
+
+static int cxlBenchBuildRequest(cxlBenchCtx *ctx, int request_id,
+                                uint8_t *buf, uint32_t *len_out) {
+    char keybuf[256];
+    int key_id = 0;
+    if (config.randomkeys && config.randomkeys_keyspacelen > 0)
+        key_id = request_id % config.randomkeys_keyspacelen;
+    int key_len = snprintf(keybuf, sizeof(keybuf), "key:%012d", key_id);
+    if (key_len <= 0 || key_len > 255) return C_ERR;
+
+    uint16_t value_len = ctx->op == CXL_OP_SET ? (uint16_t)ctx->value_len : 0U;
+    return cxlBenchBuildRawRequest(ctx->op, keybuf, key_len,
+                                   ctx->op == CXL_OP_SET ? ctx->value : NULL,
+                                   value_len, buf, len_out);
+}
+
+static int cxlBenchSendRequest(cxlBenchCtx *ctx, int ring_idx, uint32_t cid,
+                               uint8_t *plain, uint32_t plain_len) {
+    struct cxl_ring_queue_view *q = &ctx->rings[ring_idx].q21;
+    int spins = 0;
+    while (!ctx->errors) {
+        int rc = cxlRingQueueSend(q, cid, CXL_RING_MSG_DATA, 0U,
+                                  plain, plain_len);
+        if (rc == 1) {
+            CXL_BENCH_DEBUGF("CXL benchmark: sent ring=%d cid=%u len=%u spins=%d\n",
+                             ring_idx, cid, plain_len, spins);
+            return C_OK;
+        }
+        if (rc < 0) return C_ERR;
+        spins++;
+        sched_yield();
+    }
+    return C_ERR;
+}
+
+static int cxlBenchRecvResponse(cxlBenchCtx *ctx, int ring_idx, uint32_t cid,
+                                int *status_out, uint16_t *value_len_out) {
+    uint32_t rcid = 0, len = 0;
+    uint16_t type = 0, flags = 0;
+    uint8_t *payload = NULL;
+    int spins = 0;
+    while (!ctx->errors) {
+        int rc = cxlRingQueueRecv(&ctx->rings[ring_idx].q12, &rcid, &type,
+                                  &flags, &payload, &len);
+        if (rc == 0) {
+            spins++;
+            sched_yield();
+            continue;
+        }
+        if (rc < 0 || type != CXL_RING_MSG_DATA || rcid != cid)
+            return C_ERR;
+        UNUSED(flags);
+
+        if (len < 4U) return C_ERR;
+        *status_out = payload[0];
+        *value_len_out = (uint16_t)payload[1] | ((uint16_t)payload[2] << 8);
+        if ((uint32_t)*value_len_out + 4U > len) return C_ERR;
+        CXL_BENCH_DEBUGF("CXL benchmark: recv ring=%d cid=%u status=%d len=%u spins=%d\n",
+                         ring_idx, cid, *status_out, len, spins);
+        return C_OK;
+    }
+    return C_ERR;
+}
+
+static void *cxlBenchThreadMain(void *argptr) {
+    cxlBenchThreadArg *arg = argptr;
+    cxlBenchCtx *ctx = arg->ctx;
+    int ring_idx = arg->index % ctx->ring_count;
+    uint32_t cid = (uint32_t)arg->index + 1U;
+    uint8_t req[CXL_RING_MAX_PAYLOAD];
+    long long *starts = zmalloc(sizeof(long long) * config.pipeline);
+    CXL_BENCH_DEBUGF("CXL benchmark: worker start index=%d ring=%d cid=%u\n",
+                     arg->index, ring_idx, cid);
+
+    while (!ctx->errors) {
+        int batch = 0;
+        for (; batch < config.pipeline; batch++) {
+            int request_id = __sync_fetch_and_add(&ctx->issued, 1);
+            if (request_id >= config.requests) break;
+            uint32_t req_len = 0;
+            if (cxlBenchBuildRequest(ctx, request_id, req, &req_len) != C_OK ||
+                cxlBenchSendRequest(ctx, ring_idx, cid, req, req_len) != C_OK) {
+                ctx->errors = 1;
+                break;
+            }
+            starts[batch] = ustime();
+        }
+        if (batch == 0 || ctx->errors) break;
+
+        for (int i = 0; i < batch; i++) {
+            int status = 0;
+            uint16_t value_len = 0;
+            if (cxlBenchRecvResponse(ctx, ring_idx, cid, &status, &value_len) != C_OK) {
+                ctx->errors = 1;
+                break;
+            }
+            if (status == CXL_STATUS_ERR) {
+                ctx->errors = 1;
+                break;
+            }
+            long long latency = ustime() - starts[i];
+            int idx = __sync_fetch_and_add(&ctx->finished, 1);
+            if (idx < config.requests) ctx->latencies_us[idx] = latency;
+            __sync_fetch_and_add(&ctx->total_latency_us, latency);
+            UNUSED(value_len);
+        }
+    }
+    zfree(starts);
+    return NULL;
+}
+
+static int cmpLongLong(const void *a, const void *b) {
+    long long aa = *(const long long *)a;
+    long long bb = *(const long long *)b;
+    return (aa > bb) - (aa < bb);
+}
+
+static long long cxlBenchPercentile(long long *values, int count, int pct) {
+    if (count <= 0) return 0;
+    long long idx = ((long long)count * pct) / 100;
+    if (idx >= count) idx = count - 1;
+    return values[idx];
+}
+
+static void cxlBenchReport(const char *title, cxlBenchCtx *ctx) {
+    int count = ctx->finished;
+    if (count <= 0) {
+        fprintf(stderr, "%s: no completed requests\n", title);
+        return;
+    }
+
+    qsort(ctx->latencies_us, count, sizeof(long long), cmpLongLong);
+    double seconds = (double)(ctx->end_us - ctx->start_us) / 1000000.0;
+    if (seconds <= 0.0) seconds = 0.000001;
+    double rps = (double)count / seconds;
+    double avg_ms = ((double)ctx->total_latency_us / (double)count) / 1000.0;
+    double min_ms = (double)ctx->latencies_us[0] / 1000.0;
+    double p50_ms = (double)cxlBenchPercentile(ctx->latencies_us, count, 50) / 1000.0;
+    double p95_ms = (double)cxlBenchPercentile(ctx->latencies_us, count, 95) / 1000.0;
+    double p99_ms = (double)cxlBenchPercentile(ctx->latencies_us, count, 99) / 1000.0;
+    double max_ms = (double)ctx->latencies_us[count - 1] / 1000.0;
+
+    if (config.csv) {
+        printf("\"%s\",\"%.2f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\"\n",
+               title, rps, avg_ms, min_ms, p50_ms, p95_ms, p99_ms, max_ms);
+    } else if (config.quiet) {
+        printf("%s: %.2f requests per second\n", title, rps);
+    } else {
+        printf("====== %s ======\n", title);
+        printf("  mode: %s\n", cxlBenchModeName());
+        printf("  requests: %d\n", count);
+        printf("  throughput: %.2f requests per second\n", rps);
+        printf("  latency ms: avg %.3f min %.3f p50 %.3f p95 %.3f p99 %.3f max %.3f\n",
+               avg_ms, min_ms, p50_ms, p95_ms, p99_ms, max_ms);
+    }
+}
+
+static const char *cxlYcsbWorkloadName(void) {
+    static const char *names[] = {"A", "B", "C", "D", "E", "F"};
+    return names[config.ycsb_workload];
+}
+
+static const char *cxlYcsbPhaseName(int load_phase) {
+    return load_phase ? "LOAD" : "RUN";
+}
+
+static const char *ycsbTransportName(void) {
+    return config.cxl_enabled ? cxlBenchModeName() : "TCP";
+}
+
+static const char *cxlYcsbOpName(int op) {
+    static const char *names[] = {"read", "update", "insert", "scan", "rmw"};
+    return names[op];
+}
+
+static double cxlYcsbZeta(unsigned long long n, double theta) {
+    double sum = 0.0;
+    for (unsigned long long i = 1; i <= n; i++)
+        sum += 1.0 / pow((double)i, theta);
+    return sum;
+}
+
+static void cxlYcsbZipfInit(cxlYcsbZipf *z, unsigned long long items,
+                            double theta) {
+    if (items < 1) items = 1;
+    z->items = items;
+    z->theta = theta;
+    z->zeta2theta = cxlYcsbZeta(2, theta);
+    z->alpha = 1.0 / (1.0 - theta);
+    z->zetan = cxlYcsbZeta(items, theta);
+    if (items <= 1) {
+        z->eta = 0.0;
+    } else {
+        z->eta = (1.0 - pow(2.0 / (double)items, 1.0 - theta)) /
+                 (1.0 - z->zeta2theta / z->zetan);
+    }
+}
+
+static uint64_t cxlYcsbRand64(uint64_t *state) {
+    uint64_t x = *state;
+    if (x == 0) x = 88172645463325252ULL;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 2685821657736338717ULL;
+}
+
+static double cxlYcsbRandDouble(uint64_t *state) {
+    return (double)(cxlYcsbRand64(state) >> 11) *
+           (1.0 / 9007199254740992.0);
+}
+
+static unsigned long long cxlYcsbFnv64(unsigned long long value) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (int i = 0; i < 8; i++) {
+        hash ^= (uint8_t)((value >> (i * 8)) & 0xffU);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static unsigned long long cxlYcsbZipfNext(cxlYcsbZipf *z, uint64_t *rng) {
+    if (z->items <= 1) return 0;
+    double u = cxlYcsbRandDouble(rng);
+    double uz = u * z->zetan;
+    if (uz < 1.0) return 0;
+    if (uz < 1.0 + pow(0.5, z->theta)) return 1;
+    unsigned long long ret =
+        (unsigned long long)((double)z->items *
+                             pow(z->eta * u - z->eta + 1.0, z->alpha));
+    return ret < z->items ? ret : z->items - 1;
+}
+
+static int cxlYcsbEffectiveRequestDist(void) {
+    if (config.ycsb_request_distribution != CXL_YCSB_DIST_AUTO)
+        return config.ycsb_request_distribution;
+    if (config.ycsb_workload == CXL_YCSB_WORKLOAD_D)
+        return CXL_YCSB_DIST_LATEST;
+    return CXL_YCSB_DIST_ZIPFIAN;
+}
+
+static unsigned long long cxlYcsbCurrentKeyLimit(cxlBenchCtx *ctx) {
+    unsigned long long limit = ctx->ycsb_next_insert_id;
+    if (limit == 0) limit = config.ycsb_record_count;
+    return limit ? limit : 1;
+}
+
+static unsigned long long cxlYcsbChooseKeyId(cxlBenchCtx *ctx, int latest,
+                                             uint64_t *rng) {
+    unsigned long long limit = cxlYcsbCurrentKeyLimit(ctx);
+    int dist = latest ? CXL_YCSB_DIST_LATEST : cxlYcsbEffectiveRequestDist();
+
+    if (dist == CXL_YCSB_DIST_UNIFORM)
+        return cxlYcsbRand64(rng) % limit;
+
+    unsigned long long raw = cxlYcsbZipfNext(&ycsb_key_zipf, rng);
+    raw %= limit;
+    if (dist == CXL_YCSB_DIST_LATEST)
+        return limit - raw - 1;
+    return cxlYcsbFnv64(raw) % limit;
+}
+
+static uint16_t cxlYcsbChooseScanLength(uint64_t *rng) {
+    unsigned max_len = (unsigned)config.ycsb_max_scan_length;
+    if (max_len == 0) max_len = 1;
+    if (config.ycsb_scan_length_distribution == CXL_YCSB_DIST_ZIPFIAN) {
+        unsigned long long raw = cxlYcsbZipfNext(&ycsb_scan_zipf, rng);
+        return (uint16_t)((raw % max_len) + 1U);
+    }
+    return (uint16_t)((cxlYcsbRand64(rng) % max_len) + 1U);
+}
+
+static int cxlYcsbFormatKey(unsigned long long key_id, char *buf,
+                            size_t buf_len) {
+    int len = snprintf(buf, buf_len, "%s%0*llu", config.ycsb_key_prefix,
+                       config.ycsb_key_width, key_id);
+    if (len <= 0 || len >= (int)buf_len || len > 255)
+        return C_ERR;
+    return len;
+}
+
+static int cxlYcsbBuildCxlRequest(cxlBenchCtx *ctx, int cxl_op,
+                                  unsigned long long key_id,
+                                  uint16_t scan_len, uint8_t *buf,
+                                  uint32_t *len_out) {
+    char keybuf[256];
+    int key_len = cxlYcsbFormatKey(key_id, keybuf, sizeof(keybuf));
+    if (key_len == C_ERR) return C_ERR;
+
+    if (cxl_op == CXL_OP_SET) {
+        return cxlBenchBuildRawRequest(CXL_OP_SET, keybuf, key_len,
+                                       ctx->value, (uint16_t)ctx->value_len,
+                                       buf, len_out);
+    }
+    if (cxl_op == CXL_OP_SCAN) {
+        return cxlBenchBuildRawRequest(CXL_OP_SCAN, keybuf, key_len,
+                                       NULL, scan_len, buf, len_out);
+    }
+    return cxlBenchBuildRawRequest(CXL_OP_GET, keybuf, key_len,
+                                   NULL, 0, buf, len_out);
+}
+
+static int cxlYcsbChooseRunOperation(uint64_t *rng) {
+    double p = cxlYcsbRandDouble(rng);
+    switch (config.ycsb_workload) {
+    case CXL_YCSB_WORKLOAD_A:
+        return p < 0.5 ? CXL_YCSB_OP_READ : CXL_YCSB_OP_UPDATE;
+    case CXL_YCSB_WORKLOAD_B:
+        return p < 0.95 ? CXL_YCSB_OP_READ : CXL_YCSB_OP_UPDATE;
+    case CXL_YCSB_WORKLOAD_C:
+        return CXL_YCSB_OP_READ;
+    case CXL_YCSB_WORKLOAD_D:
+        return p < 0.95 ? CXL_YCSB_OP_READ : CXL_YCSB_OP_INSERT;
+    case CXL_YCSB_WORKLOAD_E:
+        return p < 0.95 ? CXL_YCSB_OP_SCAN : CXL_YCSB_OP_INSERT;
+    case CXL_YCSB_WORKLOAD_F:
+        return p < 0.5 ? CXL_YCSB_OP_READ : CXL_YCSB_OP_RMW;
+    default:
+        return CXL_YCSB_OP_READ;
+    }
+}
+
+static int cxlYcsbFirstCxlOp(int logical_op) {
+    switch (logical_op) {
+    case CXL_YCSB_OP_UPDATE:
+    case CXL_YCSB_OP_INSERT:
+        return CXL_OP_SET;
+    case CXL_YCSB_OP_SCAN:
+        return CXL_OP_SCAN;
+    default:
+        return CXL_OP_GET;
+    }
+}
+
+static void cxlYcsbCountCxlRequest(cxlBenchCtx *ctx, int cxl_op) {
+    if (cxl_op == CXL_OP_GET)
+        __sync_fetch_and_add(&ctx->ycsb_cxl_gets, 1);
+    else if (cxl_op == CXL_OP_SET)
+        __sync_fetch_and_add(&ctx->ycsb_cxl_sets, 1);
+    else if (cxl_op == CXL_OP_SCAN)
+        __sync_fetch_and_add(&ctx->ycsb_cxl_scans, 1);
+}
+
+static int cxlYcsbBuildPending(cxlBenchCtx *ctx, int request_id,
+                               uint64_t *rng, cxlYcsbPending *pending) {
+    memset(pending, 0, sizeof(*pending));
+    if (ctx->ycsb_load_phase) {
+        pending->logical_op = CXL_YCSB_OP_INSERT;
+        pending->key_id = (unsigned long long)request_id;
+        return C_OK;
+    }
+
+    int op = cxlYcsbChooseRunOperation(rng);
+    pending->logical_op = op;
+    if (op == CXL_YCSB_OP_INSERT) {
+        pending->key_id =
+            __sync_fetch_and_add(&ctx->ycsb_next_insert_id, 1ULL);
+    } else {
+        int latest = config.ycsb_workload == CXL_YCSB_WORKLOAD_D &&
+                     op == CXL_YCSB_OP_READ;
+        pending->key_id = cxlYcsbChooseKeyId(ctx, latest, rng);
+    }
+    if (op == CXL_YCSB_OP_SCAN)
+        pending->scan_len = cxlYcsbChooseScanLength(rng);
+    return C_OK;
+}
+
+static void cxlYcsbRecordLatency(cxlBenchCtx *ctx, int logical_op,
+                                 long long latency) {
+    cxlYcsbOpStats *stats = &ycsb_stats[logical_op];
+    int idx = __sync_fetch_and_add(&stats->count, 1);
+    if (idx < ctx->ycsb_target_ops)
+        stats->latencies_us[idx] = latency;
+    __sync_fetch_and_add(&stats->total_latency_us, latency);
+    __sync_fetch_and_add(&ctx->finished, 1);
+}
+
+static int cxlYcsbSendOne(cxlBenchCtx *ctx, int ring_idx, uint32_t cid,
+                          int cxl_op, cxlYcsbPending *pending,
+                          uint8_t *req) {
+    uint32_t req_len = 0;
+    if (cxlYcsbBuildCxlRequest(ctx, cxl_op, pending->key_id,
+                               pending->scan_len, req, &req_len) != C_OK)
+        return C_ERR;
+    if (cxlBenchSendRequest(ctx, ring_idx, cid, req, req_len) != C_OK)
+        return C_ERR;
+    cxlYcsbCountCxlRequest(ctx, cxl_op);
+    return C_OK;
+}
+
+static void *cxlYcsbThreadMain(void *argptr) {
+    cxlBenchThreadArg *arg = argptr;
+    cxlBenchCtx *ctx = arg->ctx;
+    int ring_idx = arg->index % ctx->ring_count;
+    uint32_t cid = (uint32_t)arg->index + 1U;
+    int pipeline = config.ycsb_workload == CXL_YCSB_WORKLOAD_F ?
+        1 : config.pipeline;
+    uint64_t rng = config.ycsb_seed ?
+        config.ycsb_seed + (uint64_t)arg->index * 0x9e3779b97f4a7c15ULL :
+        (uint64_t)ustime() ^ ((uint64_t)getpid() << 32) ^
+            ((uint64_t)arg->index + 1U);
+    uint8_t req[CXL_RING_MAX_PAYLOAD];
+    cxlYcsbPending *pending = zmalloc(sizeof(*pending) * pipeline);
+
+    while (!ctx->errors) {
+        int batch = 0;
+        for (; batch < pipeline; batch++) {
+            int request_id = __sync_fetch_and_add(&ctx->issued, 1);
+            if (request_id >= ctx->ycsb_target_ops) break;
+            if (cxlYcsbBuildPending(ctx, request_id, &rng,
+                                    &pending[batch]) != C_OK) {
+                ctx->errors = 1;
+                break;
+            }
+            int cxl_op = cxlYcsbFirstCxlOp(pending[batch].logical_op);
+            pending[batch].start_us = ustime();
+            if (cxlYcsbSendOne(ctx, ring_idx, cid, cxl_op,
+                               &pending[batch], req) != C_OK) {
+                ctx->errors = 1;
+                break;
+            }
+        }
+        if (batch == 0 || ctx->errors) break;
+
+        for (int i = 0; i < batch; i++) {
+            int status = 0;
+            uint16_t value_len = 0;
+            if (cxlBenchRecvResponse(ctx, ring_idx, cid,
+                                     &status, &value_len) != C_OK) {
+                ctx->errors = 1;
+                break;
+            }
+            if (status == CXL_STATUS_ERR) {
+                ctx->errors = 1;
+                break;
+            }
+            if (pending[i].logical_op == CXL_YCSB_OP_RMW) {
+                if (cxlYcsbSendOne(ctx, ring_idx, cid, CXL_OP_SET,
+                                   &pending[i], req) != C_OK ||
+                    cxlBenchRecvResponse(ctx, ring_idx, cid,
+                                         &status, &value_len) != C_OK ||
+                    status == CXL_STATUS_ERR) {
+                    ctx->errors = 1;
+                    break;
+                }
+            }
+            long long latency = ustime() - pending[i].start_us;
+            cxlYcsbRecordLatency(ctx, pending[i].logical_op, latency);
+        }
+    }
+    zfree(pending);
+    return NULL;
+}
+
+static void cxlRunWorkerGroup(cxlBenchCtx *ctx, int workers,
+                              void *(*worker_main)(void *),
+                              const char *label) {
+    pthread_t tids[MAX_THREADS];
+    cxlBenchThreadArg args[MAX_THREADS];
+    int first_pthread = config.threads_use_main ? 1 : 0;
+
+    for (int i = 0; i < workers; i++) {
+        args[i].ctx = ctx;
+        args[i].index = i;
+    }
+    for (int i = first_pthread; i < workers; i++) {
+        if (pthread_create(&tids[i], NULL, worker_main, &args[i]) != 0) {
+            fprintf(stderr, "%s: pthread_create failed\n", label);
+            ctx->errors = 1;
+            workers = i;
+            break;
+        }
+    }
+    if (config.threads_use_main && workers > 0)
+        worker_main(&args[0]);
+    for (int i = first_pthread; i < workers; i++)
+        pthread_join(tids[i], NULL);
+}
+
+static void cxlYcsbFreePhaseStats(void) {
+    for (int i = 0; i < CXL_YCSB_OP_MAX; i++) {
+        if (ycsb_stats[i].latencies_us != NULL) {
+            zfree(ycsb_stats[i].latencies_us);
+            ycsb_stats[i].latencies_us = NULL;
+        }
+        ycsb_stats[i].count = 0;
+        ycsb_stats[i].total_latency_us = 0;
+    }
+}
+
+static int cxlYcsbInitPhaseStats(int target_ops) {
+    cxlYcsbFreePhaseStats();
+    for (int i = 0; i < CXL_YCSB_OP_MAX; i++) {
+        ycsb_stats[i].latencies_us = zcalloc(sizeof(long long) * target_ops);
+        if (ycsb_stats[i].latencies_us == NULL) {
+            cxlYcsbFreePhaseStats();
+            return C_ERR;
+        }
+    }
+    return C_OK;
+}
+
+static void cxlYcsbReportPhase(cxlBenchCtx *ctx, const char *phase,
+                               long long start_us, long long end_us) {
+    double seconds = (double)(end_us - start_us) / 1000000.0;
+    if (seconds <= 0.0) seconds = 0.000001;
+    int total = ctx->finished;
+    long long total_latency = 0;
+    for (int i = 0; i < CXL_YCSB_OP_MAX; i++)
+        total_latency += ycsb_stats[i].total_latency_us;
+
+    if (!config.csv && !config.quiet) {
+        printf("====== YCSB-%s-%s-%s ======\n",
+               cxlYcsbWorkloadName(), ycsbTransportName(), phase);
+        printf("  logical operations: %d\n", total);
+        printf("  throughput: %.2f operations per second\n",
+               (double)total / seconds);
+        printf("  latency ms: avg %.3f\n",
+               total ? ((double)total_latency / (double)total) / 1000.0 : 0.0);
+        printf("  transport requests: get=%lld set=%lld scan=%lld\n",
+               ctx->ycsb_cxl_gets, ctx->ycsb_cxl_sets,
+               ctx->ycsb_cxl_scans);
+    } else if (!config.csv) {
+        printf("YCSB-%s-%s-%s: %.2f operations per second\n",
+               cxlYcsbWorkloadName(), phase, ycsbTransportName(),
+               (double)total / seconds);
+    }
+
+    for (int op = 0; op < CXL_YCSB_OP_MAX; op++) {
+        cxlYcsbOpStats *stats = &ycsb_stats[op];
+        int count = stats->count;
+        if (count <= 0) continue;
+        qsort(stats->latencies_us, count, sizeof(long long), cmpLongLong);
+        double rps = (double)count / seconds;
+        double avg_ms =
+            ((double)stats->total_latency_us / (double)count) / 1000.0;
+        double min_ms = (double)stats->latencies_us[0] / 1000.0;
+        double p50_ms =
+            (double)cxlBenchPercentile(stats->latencies_us, count, 50) /
+            1000.0;
+        double p95_ms =
+            (double)cxlBenchPercentile(stats->latencies_us, count, 95) /
+            1000.0;
+        double p99_ms =
+            (double)cxlBenchPercentile(stats->latencies_us, count, 99) /
+            1000.0;
+        double max_ms = (double)stats->latencies_us[count - 1] / 1000.0;
+        if (config.csv) {
+            printf("\"%s\",\"%s\",\"%d\",\"%.2f\",\"%.3f\",\"%.3f\","
+                   "\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%lld\","
+                   "\"%lld\",\"%lld\"\n",
+                   phase, cxlYcsbOpName(op), count, rps, avg_ms, min_ms,
+                   p50_ms, p95_ms, p99_ms, max_ms, ctx->ycsb_cxl_gets,
+                   ctx->ycsb_cxl_sets, ctx->ycsb_cxl_scans);
+        } else if (!config.quiet) {
+            printf("  %-6s count=%d rps=%.2f latency_ms avg %.3f min %.3f "
+                   "p50 %.3f p95 %.3f p99 %.3f max %.3f\n",
+                   cxlYcsbOpName(op), count, rps, avg_ms, min_ms, p50_ms,
+                   p95_ms, p99_ms, max_ms);
+        }
+    }
+}
+
+static int cxlYcsbRunPhase(cxlBenchCtx *ctx, int load_phase, int target_ops) {
+    if (target_ops <= 0) return C_OK;
+    if (cxlYcsbInitPhaseStats(target_ops) != C_OK) {
+        fprintf(stderr, "YCSB benchmark: failed to allocate latency stats\n");
+        return 1;
+    }
+    ctx->issued = 0;
+    ctx->finished = 0;
+    ctx->errors = 0;
+    ctx->ycsb_target_ops = target_ops;
+    ctx->ycsb_load_phase = load_phase;
+    ctx->ycsb_cxl_gets = 0;
+    ctx->ycsb_cxl_sets = 0;
+    ctx->ycsb_cxl_scans = 0;
+
+    int workers = config.num_threads > 0 ? config.num_threads : config.numclients;
+    if (workers <= 0) workers = 1;
+    if (workers > MAX_THREADS) workers = MAX_THREADS;
+
+    long long start_us = ustime();
+    cxlRunWorkerGroup(ctx, workers, cxlYcsbThreadMain, "YCSB benchmark");
+    long long end_us = ustime();
+
+    cxlYcsbReportPhase(ctx, cxlYcsbPhaseName(load_phase), start_us, end_us);
+    int failed = ctx->errors || ctx->finished < target_ops;
+    if (failed) {
+        fprintf(stderr, "YCSB benchmark: completed %d/%d %s operations%s\n",
+                ctx->finished, target_ops, cxlYcsbPhaseName(load_phase),
+                ctx->errors ? " with errors" : "");
+    }
+    cxlYcsbFreePhaseStats();
+    return failed ? 1 : 0;
+}
+
+static int cxlYcsbPrepareConfig(void) {
+    if (config.ycsb_record_count == 0)
+        config.ycsb_record_count = (unsigned long long)config.requests;
+    if (config.ycsb_operation_count == 0)
+        config.ycsb_operation_count = (unsigned long long)config.requests;
+    if (!config.ycsb_insert_start_set)
+        config.ycsb_insert_start = config.ycsb_record_count;
+    if (!config.datasize_set) {
+        unsigned long long size =
+            (unsigned long long)config.ycsb_field_count *
+            (unsigned long long)config.ycsb_field_length;
+        if (size == 0 || size > INT_MAX) return C_ERR;
+        config.datasize = (int)size;
+    }
+    if (config.ycsb_record_count == 0 ||
+        config.ycsb_operation_count == 0 ||
+        config.ycsb_record_count > INT_MAX ||
+        config.ycsb_operation_count > INT_MAX ||
+        config.ycsb_insert_start > ULLONG_MAX - config.ycsb_operation_count ||
+        config.datasize <= 0 || config.datasize > UINT16_MAX)
+        return C_ERR;
+    if (config.pipeline >= (int)CXL_RING_QUEUE_CAPACITY)
+        return C_ERR;
+
+    unsigned long long zipf_items =
+        config.ycsb_insert_start + config.ycsb_operation_count + 1ULL;
+    cxlYcsbZipfInit(&ycsb_key_zipf, zipf_items, config.ycsb_zipf_theta);
+    cxlYcsbZipfInit(&ycsb_scan_zipf,
+                    (unsigned long long)config.ycsb_max_scan_length,
+                    config.ycsb_zipf_theta);
+    config.requests = (int)config.ycsb_operation_count;
+    return C_OK;
+}
+
+static int tcpYcsbAppendCommand(redisContext *redis, cxlBenchCtx *ctx,
+                                cxlYcsbPending *pending) {
+    char keybuf[256];
+    if (cxlYcsbFormatKey(pending->key_id, keybuf, sizeof(keybuf)) == C_ERR)
+        return C_ERR;
+
+    switch (pending->logical_op) {
+    case CXL_YCSB_OP_UPDATE:
+    case CXL_YCSB_OP_INSERT:
+        if (redisAppendCommand(redis, "SET %s %b", keybuf,
+                               ctx->value, (size_t)ctx->value_len) != REDIS_OK)
+            return C_ERR;
+        __sync_fetch_and_add(&ctx->ycsb_cxl_sets, 1);
+        return C_OK;
+    case CXL_YCSB_OP_SCAN: {
+        sds cmd = sdsnew("MGET");
+        size_t prefix_len = strlen(config.ycsb_key_prefix);
+        unsigned long long start_id = pending->key_id;
+        for (uint16_t i = 0; i < pending->scan_len; i++) {
+            int key_len = snprintf(keybuf, sizeof(keybuf), "%s%0*llu",
+                                   config.ycsb_key_prefix,
+                                   config.ycsb_key_width, start_id + i);
+            if (key_len <= 0 || key_len >= (int)sizeof(keybuf) ||
+                key_len <= (int)prefix_len) {
+                sdsfree(cmd);
+                return C_ERR;
+            }
+            cmd = sdscatfmt(cmd, " %s", keybuf);
+        }
+        int rc = redisAppendCommand(redis, cmd);
+        sdsfree(cmd);
+        if (rc != REDIS_OK) return C_ERR;
+        __sync_fetch_and_add(&ctx->ycsb_cxl_scans, 1);
+        return C_OK;
+    }
+    default:
+        if (redisAppendCommand(redis, "GET %s", keybuf) != REDIS_OK)
+            return C_ERR;
+        __sync_fetch_and_add(&ctx->ycsb_cxl_gets, 1);
+        return C_OK;
+    }
+}
+
+static int tcpYcsbDrainReply(redisContext *redis) {
+    void *raw = NULL;
+    int rc = redisGetReply(redis, &raw);
+    redisReply *reply = rc == REDIS_OK ? raw : NULL;
+    if (rc != REDIS_OK || reply == NULL) {
+        if (reply != NULL) freeReplyObject(reply);
+        return C_ERR;
+    }
+    int ok = reply->type != REDIS_REPLY_ERROR;
+    freeReplyObject(reply);
+    return ok ? C_OK : C_ERR;
+}
+
+static void *tcpYcsbThreadMain(void *argptr) {
+    cxlBenchThreadArg *arg = argptr;
+    cxlBenchCtx *ctx = arg->ctx;
+    int pipeline = config.ycsb_workload == CXL_YCSB_WORKLOAD_F ?
+        1 : config.pipeline;
+    uint64_t rng = config.ycsb_seed ?
+        config.ycsb_seed + (uint64_t)arg->index * 0x9e3779b97f4a7c15ULL :
+        (uint64_t)ustime() ^ ((uint64_t)getpid() << 32) ^
+            ((uint64_t)arg->index + 1U);
+    cxlYcsbPending *pending = zmalloc(sizeof(*pending) * pipeline);
+    redisContext *redis = getRedisContext(config.conn_info.hostip,
+                                          config.conn_info.hostport,
+                                          config.hostsocket);
+    if (redis == NULL) {
+        ctx->errors = 1;
+        zfree(pending);
+        return NULL;
+    }
+
+    while (!ctx->errors) {
+        int batch = 0;
+        for (; batch < pipeline; batch++) {
+            int request_id = __sync_fetch_and_add(&ctx->issued, 1);
+            if (request_id >= ctx->ycsb_target_ops) break;
+            if (cxlYcsbBuildPending(ctx, request_id, &rng,
+                                    &pending[batch]) != C_OK) {
+                ctx->errors = 1;
+                break;
+            }
+            pending[batch].start_us = ustime();
+            if (tcpYcsbAppendCommand(redis, ctx, &pending[batch]) != C_OK) {
+                ctx->errors = 1;
+                break;
+            }
+        }
+        if (batch == 0 || ctx->errors) break;
+
+        for (int i = 0; i < batch; i++) {
+            if (tcpYcsbDrainReply(redis) != C_OK) {
+                ctx->errors = 1;
+                break;
+            }
+            if (pending[i].logical_op == CXL_YCSB_OP_RMW) {
+                pending[i].logical_op = CXL_YCSB_OP_UPDATE;
+                if (tcpYcsbAppendCommand(redis, ctx, &pending[i]) != C_OK ||
+                    tcpYcsbDrainReply(redis) != C_OK) {
+                    ctx->errors = 1;
+                    break;
+                }
+                pending[i].logical_op = CXL_YCSB_OP_RMW;
+            }
+            long long latency = ustime() - pending[i].start_us;
+            cxlYcsbRecordLatency(ctx, pending[i].logical_op, latency);
+        }
+    }
+
+    redisFree(redis);
+    zfree(pending);
+    return NULL;
+}
+
+static int tcpYcsbRunPhase(cxlBenchCtx *ctx, int load_phase, int target_ops) {
+    if (target_ops <= 0) return C_OK;
+    if (cxlYcsbInitPhaseStats(target_ops) != C_OK) {
+        fprintf(stderr, "YCSB benchmark: failed to allocate latency stats\n");
+        return 1;
+    }
+    ctx->issued = 0;
+    ctx->finished = 0;
+    ctx->errors = 0;
+    ctx->ycsb_target_ops = target_ops;
+    ctx->ycsb_load_phase = load_phase;
+    ctx->ycsb_cxl_gets = 0;
+    ctx->ycsb_cxl_sets = 0;
+    ctx->ycsb_cxl_scans = 0;
+
+    int workers = config.num_threads > 0 ? config.num_threads : config.numclients;
+    if (workers <= 0) workers = 1;
+    if (workers > MAX_THREADS) workers = MAX_THREADS;
+
+    long long start_us = ustime();
+    cxlRunWorkerGroup(ctx, workers, tcpYcsbThreadMain, "YCSB TCP benchmark");
+    long long end_us = ustime();
+
+    cxlYcsbReportPhase(ctx, cxlYcsbPhaseName(load_phase), start_us, end_us);
+    int failed = ctx->errors || ctx->finished < target_ops;
+    if (failed) {
+        fprintf(stderr, "YCSB benchmark: completed %d/%d %s operations%s\n",
+                ctx->finished, target_ops, cxlYcsbPhaseName(load_phase),
+                ctx->errors ? " with errors" : "");
+    }
+    cxlYcsbFreePhaseStats();
+    return failed ? 1 : 0;
+}
+
+static int tcpYcsbBenchmarkMain(void) {
+    if (cxlYcsbPrepareConfig() != C_OK) {
+        fprintf(stderr,
+                "YCSB benchmark: invalid configuration or unsupported value size\n");
+        return 1;
+    }
+    if (config.pipeline <= 0) config.pipeline = 1;
+
+    cxlBenchCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fd = -1;
+    ctx.value_len = config.datasize;
+    ctx.value = zmalloc(ctx.value_len ? ctx.value_len : 1);
+    genBenchmarkRandomData(ctx.value, ctx.value_len ? ctx.value_len : 1);
+
+    if (config.csv) {
+        printf("\"phase\",\"op\",\"operations\",\"rps\",\"avg_latency_ms\","
+               "\"min_latency_ms\",\"p50_latency_ms\",\"p95_latency_ms\","
+               "\"p99_latency_ms\",\"max_latency_ms\",\"tcp_gets\","
+               "\"tcp_sets\",\"tcp_scans\"\n");
+    }
+
+    int rc = 0;
+    if (config.ycsb_phase == CXL_YCSB_PHASE_LOAD ||
+        config.ycsb_phase == CXL_YCSB_PHASE_LOAD_RUN) {
+        ctx.ycsb_next_insert_id = config.ycsb_record_count;
+        rc |= tcpYcsbRunPhase(&ctx, 1, (int)config.ycsb_record_count);
+    }
+    if (!rc && (config.ycsb_phase == CXL_YCSB_PHASE_RUN ||
+                config.ycsb_phase == CXL_YCSB_PHASE_LOAD_RUN)) {
+        ctx.ycsb_next_insert_id = config.ycsb_insert_start;
+        rc |= tcpYcsbRunPhase(&ctx, 0, (int)config.ycsb_operation_count);
+    }
+
+    cxlBenchClose(&ctx);
+    return rc;
+}
+
+static int cxlYcsbBenchmarkMain(void) {
+    if (cxlYcsbPrepareConfig() != C_OK) {
+        fprintf(stderr,
+                "YCSB benchmark: invalid configuration or unsupported value size\n");
+        return 1;
+    }
+
+    cxlBenchCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fd = -1;
+    ctx.map_size = config.cxl_ring_map_size ?
+        config.cxl_ring_map_size : CXL_BENCH_DEFAULT_MAP_SIZE;
+    ctx.map_offset = config.cxl_ring_offset;
+    ctx.region_base = config.cxl_ring_region_base;
+    ctx.region_size = config.cxl_ring_region_size ?
+        config.cxl_ring_region_size : cxlRingDefaultRegionSize();
+    ctx.value_len = config.datasize;
+    ctx.value = zmalloc(ctx.value_len ? ctx.value_len : 1);
+    genBenchmarkRandomData(ctx.value, ctx.value_len ? ctx.value_len : 1);
+
+    int workers = config.num_threads > 0 ? config.num_threads : config.numclients;
+    if (workers <= 0) workers = 1;
+    if (workers > MAX_THREADS) workers = MAX_THREADS;
+    ctx.ring_count = config.cxl_ring_count > 0 ? config.cxl_ring_count : workers;
+    if (ctx.ring_count < workers) {
+        fprintf(stderr, "YCSB benchmark: --cxl-ring-count (%d) must be >= worker threads (%d)\n",
+                ctx.ring_count, workers);
+        cxlBenchClose(&ctx);
+        return 1;
+    }
+    if (ctx.ring_count > MAX_THREADS) {
+        fprintf(stderr, "YCSB benchmark: ring count too large (max %d)\n",
+                MAX_THREADS);
+        cxlBenchClose(&ctx);
+        return 1;
+    }
+    if (cxlBenchOpenAndMap(&ctx) != C_OK) {
+        cxlBenchClose(&ctx);
+        return 1;
+    }
+
+    if (config.csv) {
+        printf("\"phase\",\"op\",\"operations\",\"rps\",\"avg_latency_ms\","
+               "\"min_latency_ms\",\"p50_latency_ms\",\"p95_latency_ms\","
+               "\"p99_latency_ms\",\"max_latency_ms\",\"cxl_gets\","
+               "\"cxl_sets\",\"cxl_scans\"\n");
+    }
+
+    int rc = 0;
+    if (config.ycsb_phase == CXL_YCSB_PHASE_LOAD ||
+        config.ycsb_phase == CXL_YCSB_PHASE_LOAD_RUN) {
+        ctx.ycsb_next_insert_id = config.ycsb_record_count;
+        rc |= cxlYcsbRunPhase(&ctx, 1, (int)config.ycsb_record_count);
+    }
+    if (!rc && (config.ycsb_phase == CXL_YCSB_PHASE_RUN ||
+                config.ycsb_phase == CXL_YCSB_PHASE_LOAD_RUN)) {
+        ctx.ycsb_next_insert_id = config.ycsb_insert_start;
+        rc |= cxlYcsbRunPhase(&ctx, 0, (int)config.ycsb_operation_count);
+    }
+
+    cxlBenchClose(&ctx);
+    return rc;
+}
+
+static int cxlBenchmarkRunOne(const char *name, int op) {
+    cxlBenchCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fd = -1;
+    ctx.op = op;
+    ctx.map_size = config.cxl_ring_map_size ?
+        config.cxl_ring_map_size : CXL_BENCH_DEFAULT_MAP_SIZE;
+    ctx.map_offset = config.cxl_ring_offset;
+    ctx.region_base = config.cxl_ring_region_base;
+    ctx.region_size = config.cxl_ring_region_size ?
+        config.cxl_ring_region_size : cxlRingDefaultRegionSize();
+    int workers = config.num_threads > 0 ? config.num_threads : config.numclients;
+    if (workers <= 0) workers = 1;
+    if (workers > MAX_THREADS) workers = MAX_THREADS;
+    ctx.ring_count = config.cxl_ring_count > 0 ? config.cxl_ring_count : workers;
+    if (ctx.ring_count < workers) {
+        fprintf(stderr, "CXL benchmark: --cxl-ring-count (%d) must be >= worker threads (%d)\n",
+                ctx.ring_count, workers);
+        return 1;
+    }
+    if (ctx.ring_count > MAX_THREADS) {
+        fprintf(stderr, "CXL benchmark: ring count too large (max %d)\n", MAX_THREADS);
+        return 1;
+    }
+    if (config.datasize > UINT16_MAX) {
+        fprintf(stderr, "CXL benchmark: -d must be <= %u for this binary protocol\n",
+                (unsigned)UINT16_MAX);
+        return 1;
+    }
+    if (config.pipeline >= (int)CXL_RING_QUEUE_CAPACITY) {
+        fprintf(stderr, "CXL benchmark: -P must be smaller than ring capacity (%u)\n",
+                (unsigned)CXL_RING_QUEUE_CAPACITY);
+        return 1;
+    }
+    ctx.value_len = config.datasize;
+    ctx.value = zmalloc(ctx.value_len ? ctx.value_len : 1);
+    memset(ctx.value, 'x', ctx.value_len ? ctx.value_len : 1);
+    ctx.latencies_us = zcalloc(sizeof(long long) * config.requests);
+
+    if (cxlBenchOpenAndMap(&ctx) != C_OK) {
+        cxlBenchClose(&ctx);
+        return 1;
+    }
+
+    ctx.start_us = ustime();
+    cxlRunWorkerGroup(&ctx, workers, cxlBenchThreadMain, "CXL benchmark");
+    ctx.end_us = ustime();
+
+    char title[128];
+    snprintf(title, sizeof(title), "%s-CXL-%s", name, cxlBenchModeName());
+    cxlBenchReport(title, &ctx);
+    int failed = ctx.errors || ctx.finished < config.requests;
+    if (failed) {
+        fprintf(stderr, "CXL benchmark: completed %d/%d requests%s\n",
+                ctx.finished, config.requests, ctx.errors ? " with errors" : "");
+    }
+    cxlBenchClose(&ctx);
+    return failed ? 1 : 0;
+}
+
+static int redisBenchmarkTouchClientDone(int rc) {
+    if (config.gem5_client_sync_dir == NULL || config.gem5_client_id < 0)
+        return C_OK;
+
+    char dirbuf[PATH_MAX];
+    snprintf(dirbuf, sizeof(dirbuf), "%s", config.gem5_client_sync_dir);
+    size_t dirlen = strlen(dirbuf);
+    while (dirlen > 1 && dirbuf[dirlen - 1] == '/')
+        dirbuf[--dirlen] = '\0';
+    for (char *p = dirbuf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(dirbuf, 0700) != 0 && errno != EEXIST)
+            return C_ERR;
+        *p = '/';
+    }
+    if (mkdir(dirbuf, 0700) != 0 && errno != EEXIST)
+        return C_ERR;
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/client_%d.done",
+             config.gem5_client_sync_dir, config.gem5_client_id);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return C_ERR;
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "%d\n", rc);
+    if (write(fd, buf, len) != len) {
+        close(fd);
+        return C_ERR;
+    }
+    close(fd);
+    return C_OK;
+}
+
+static int redisBenchmarkWaitAllClients(void) {
+    if (config.gem5_client_sync_dir == NULL || config.gem5_client_count <= 0)
+        return C_OK;
+
+    long long deadline = ustime() +
+        (long long)config.gem5_client_sync_timeout_ms * 1000LL;
+    while (1) {
+        int complete = 1;
+        for (int i = 0; i < config.gem5_client_count; i++) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/client_%d.done",
+                     config.gem5_client_sync_dir, i);
+            struct stat st;
+            if (stat(path, &st) != 0) {
+                complete = 0;
+                break;
+            }
+        }
+        if (complete) return C_OK;
+        if (config.gem5_client_sync_timeout_ms > 0 && ustime() >= deadline)
+            return C_ERR;
+        sched_yield();
+    }
+}
+
+static void redisBenchmarkShutdownServer(void) {
+    redisContext *ctx = getRedisContext(config.conn_info.hostip,
+                                        config.conn_info.hostport,
+                                        config.hostsocket);
+    if (ctx == NULL) return;
+    redisReply *reply = redisCommand(ctx, "SHUTDOWN NOSAVE");
+    if (reply != NULL) freeReplyObject(reply);
+    redisFree(ctx);
+}
+
+static void redisBenchmarkShutdownServerOverCxl(void) {
+    cxlBenchCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fd = -1;
+    ctx.map_size = config.cxl_ring_map_size ?
+        config.cxl_ring_map_size : CXL_BENCH_DEFAULT_MAP_SIZE;
+    ctx.map_offset = config.cxl_ring_offset;
+    ctx.region_base = config.cxl_ring_region_base;
+    ctx.region_size = config.cxl_ring_region_size ?
+        config.cxl_ring_region_size : cxlRingDefaultRegionSize();
+    ctx.ring_count = config.cxl_ring_count > 0 ? config.cxl_ring_count : 1;
+    if (ctx.ring_count > MAX_THREADS)
+        ctx.ring_count = MAX_THREADS;
+
+    if (cxlBenchOpenAndMap(&ctx) == C_OK) {
+        uint32_t cid = (uint32_t)(config.gem5_client_id >= 0 ?
+                                  config.gem5_client_id + 1 : 1);
+        (void)cxlRingQueueSend(&ctx.rings[0].q21, cid, CXL_RING_MSG_CLOSE,
+                               0U, NULL, 0U);
+    }
+    cxlBenchClose(&ctx);
+}
+
+static int redisBenchmarkPostRun(int rc) {
+    if (redisBenchmarkTouchClientDone(rc) != C_OK && rc == 0)
+        rc = 1;
+
+    if (config.shutdown_server_after &&
+        (config.gem5_client_id <= 0 || config.gem5_client_count <= 1)) {
+        if (redisBenchmarkWaitAllClients() != C_OK && rc == 0)
+            rc = 1;
+        if (config.cxl_enabled)
+            redisBenchmarkShutdownServerOverCxl();
+        else
+            redisBenchmarkShutdownServer();
+    }
+
+    return rc;
+}
+
+static int cxlBenchmarkMain(int argc, char **argv) {
+    if (config.idlemode) {
+        fprintf(stderr, "CXL benchmark mode does not support idle mode.\n");
+        return 1;
+    }
+    if (config.ycsb_enabled) {
+        if (argc > 0) {
+            fprintf(stderr,
+                    "YCSB benchmark mode does not accept COMMAND ARGS.\n");
+            return 1;
+        }
+        return cxlYcsbBenchmarkMain();
+    }
+    if (config.pipeline <= 0) config.pipeline = 1;
+    if (config.requests <= 0) config.requests = 1;
+
+    if (config.csv) {
+        printf("\"test\",\"rps\",\"avg_latency_ms\",\"min_latency_ms\",\"p50_latency_ms\",\"p95_latency_ms\",\"p99_latency_ms\",\"max_latency_ms\"\n");
+    }
+
+    if (argc > 0) {
+        if (!strcasecmp(argv[0], "set"))
+            return cxlBenchmarkRunOne("SET", CXL_OP_SET);
+        if (!strcasecmp(argv[0], "get"))
+            return cxlBenchmarkRunOne("GET", CXL_OP_GET);
+        fprintf(stderr, "CXL benchmark mode supports only GET and SET command tests.\n");
+        return 1;
+    }
+
+    int rc = 0;
+    if (test_is_selected("set"))
+        rc |= cxlBenchmarkRunOne("SET", CXL_OP_SET);
+    if (test_is_selected("get"))
+        rc |= cxlBenchmarkRunOne("GET", CXL_OP_GET);
+    if (!test_is_selected("set") && !test_is_selected("get")) {
+        fprintf(stderr, "CXL benchmark mode only implements -t set,get.\n");
+        rc = 1;
+    }
+    return rc;
+}
+
 int main(int argc, char **argv) {
     int i;
     char *data, *cmd, *tag;
@@ -1710,9 +3438,12 @@ int main(int argc, char **argv) {
     config.requests = 100000;
     config.liveclients = 0;
     config.el = aeCreateEventLoop(1024*10);
+    if (redisGem5SeDontWaitEnabled())
+        aeSetDontWait(config.el, 1);
     aeCreateTimeEvent(config.el,1,showThroughput,NULL,NULL);
     config.keepalive = 1;
     config.datasize = 3;
+    config.datasize_set = 0;
     config.pipeline = 1;
     config.randomkeys = 0;
     config.randomkeys_keyspacelen = 0;
@@ -1730,6 +3461,7 @@ int main(int argc, char **argv) {
     config.conn_info.auth = NULL;
     config.precision = DEFAULT_LATENCY_PRECISION;
     config.num_threads = 0;
+    config.threads_use_main = 0;
     config.threads = NULL;
     config.cluster_mode = 0;
     config.cluster_node_count = 0;
@@ -1740,6 +3472,39 @@ int main(int argc, char **argv) {
     config.slots_last_update = 0;
     config.enable_tracking = 0;
     config.resp3 = 0;
+    config.cxl_enabled = 0;
+    config.cxl_mode = CXL_BENCH_MODE_NATIVE_SHM;
+    config.cxl_paper_preset = 0;
+    config.cxl_ring_path = NULL;
+    config.cxl_ring_map_size = 0;
+    config.cxl_ring_offset = 0;
+    config.cxl_ring_region_base = 0;
+    config.cxl_ring_region_size = 0;
+    config.cxl_ring_count = 0;
+    config.ycsb_enabled = 0;
+    config.ycsb_transport = YCSB_TRANSPORT_AUTO;
+    config.ycsb_workload = CXL_YCSB_WORKLOAD_A;
+    config.ycsb_phase = CXL_YCSB_PHASE_LOAD_RUN;
+    config.ycsb_record_count = 0;
+    config.ycsb_operation_count = 0;
+    config.ycsb_insert_start = 0;
+    config.ycsb_insert_start_set = 0;
+    config.ycsb_request_distribution = CXL_YCSB_DIST_AUTO;
+    config.ycsb_scan_length_distribution = CXL_YCSB_DIST_UNIFORM;
+    config.ycsb_max_scan_length = 100;
+    config.ycsb_field_count = 10;
+    config.ycsb_field_length = 100;
+    config.ycsb_read_all_fields = 1;
+    config.ycsb_seed = 0;
+    config.ycsb_key_prefix = strdup("user");
+    config.ycsb_key_width = 12;
+    config.ycsb_zipf_theta = 0.99;
+    config.server_ready_timeout_ms = 0;
+    config.gem5_client_id = -1;
+    config.gem5_client_count = 0;
+    config.gem5_client_sync_timeout_ms = 600000;
+    config.shutdown_server_after = 0;
+    config.gem5_client_sync_dir = NULL;
 
     i = parseOptions(argc,argv);
     argc -= i;
@@ -1752,6 +3517,18 @@ int main(int argc, char **argv) {
         cliSecureInit();
     }
 #endif
+
+    if (config.ycsb_enabled && !config.cxl_enabled) {
+        int rc = tcpYcsbBenchmarkMain();
+        return redisBenchmarkPostRun(rc);
+    }
+
+    if (config.cxl_enabled) {
+        if (config.cxl_paper_preset && config.num_threads <= 0)
+            config.num_threads = config.numclients;
+        int rc = cxlBenchmarkMain(argc, argv);
+        return redisBenchmarkPostRun(rc);
+    }
 
     if (config.cluster_mode) {
         // We only include the slot placeholder {tag} if cluster mode is enabled
@@ -2020,9 +3797,11 @@ int main(int argc, char **argv) {
         if (!config.csv) printf("\n");
     } while(config.loop);
 
+    int rc = redisBenchmarkPostRun(0);
+
     zfree(data);
     freeCliConnInfo(config.conn_info);
     if (config.redis_config != NULL) freeRedisConfig(config.redis_config);
 
-    return 0;
+    return rc;
 }

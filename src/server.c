@@ -13,6 +13,7 @@
  */
 
 #include "server.h"
+#include "cxl_ring.h"
 #include "monotonic.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
@@ -116,6 +117,11 @@ static inline int shouldShutdownAsap(void) {
     int shutdown_asap;
     atomicGet(server.shutdown_asap, shutdown_asap);
     return shutdown_asap;
+}
+
+static int gem5SeDontWaitEnabled(void) {
+    const char *value = getenv("REDIS_GEM5_SE_DONT_WAIT");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
 /* Low level logging. To use only for very big messages, otherwise
@@ -1866,6 +1872,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
     updatePeakMemory(zmalloc_used_memory());
+    cxlRingBeforeSleep();
 
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
@@ -2043,6 +2050,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
      * connection has pending data) */
+    if (gem5SeDontWaitEnabled())
+        dont_sleep = 1;
     aeSetDontWait(server.el, dont_sleep);
 
     /* Before we are going to sleep, let the threads access the dataset by
@@ -7802,6 +7811,15 @@ int main(int argc, char **argv) {
     }
 
     initServer();
+    if (gem5SeDontWaitEnabled())
+        aeSetDontWait(server.el, 1);
+    const char *cxl_ring_path = getenv("CXL_RING_PATH");
+    if (cxl_ring_path && cxl_ring_path[0]) {
+        if (cxlRingInitFromEnv() != C_OK)
+            serverLog(LL_WARNING, "CXL ring init failed; continuing with normal Redis transports.");
+    } else {
+        serverLog(LL_NOTICE, "CXL ring disabled (set CXL_RING_PATH to enable).");
+    }
     if (background || server.pidfile) createPidFile();
     if (server.set_proc_title) redisSetProcTitle(NULL);
     redisAsciiArt();

@@ -56,9 +56,63 @@ static void aeApiDelEvent(aeEventLoop *eventLoop, int fd, int mask) {
 }
 
 static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
+#ifndef REDIS_GEM5_SE_SELECT
     aeApiState *state = eventLoop->apidata;
+#endif
     int retval, j, numevents = 0;
 
+#ifdef REDIS_GEM5_SE_SELECT
+    int nfds = 0;
+    for (j = 0; j <= eventLoop->maxfd; j++) {
+        if (eventLoop->events[j].mask != AE_NONE)
+            nfds++;
+    }
+    if (nfds == 0) return 0;
+
+    struct pollfd *pfds = zmalloc(sizeof(*pfds) * nfds);
+    int *target_fds = zmalloc(sizeof(*target_fds) * nfds);
+    if (pfds == NULL || target_fds == NULL) {
+        zfree(pfds);
+        zfree(target_fds);
+        return 0;
+    }
+
+    int idx = 0;
+    for (j = 0; j <= eventLoop->maxfd; j++) {
+        aeFileEvent *fe = &eventLoop->events[j];
+        if (fe->mask == AE_NONE) continue;
+        target_fds[idx] = j;
+        pfds[idx].fd = j;
+        pfds[idx].events = 0;
+        pfds[idx].revents = 0;
+        if (fe->mask & AE_READABLE) pfds[idx].events |= POLLIN;
+        if (fe->mask & AE_WRITABLE) pfds[idx].events |= POLLOUT;
+        idx++;
+    }
+
+    int timeout_ms = 0;
+    if (tvp != NULL)
+        timeout_ms = (int)(tvp->tv_sec * 1000 + tvp->tv_usec / 1000);
+    retval = poll(pfds, nfds, timeout_ms);
+    if (retval > 0) {
+        for (idx = 0; idx < nfds; idx++) {
+            int mask = 0;
+            if (pfds[idx].revents & (POLLIN | POLLERR | POLLHUP))
+                mask |= AE_READABLE;
+            if (pfds[idx].revents & (POLLOUT | POLLERR | POLLHUP))
+                mask |= AE_WRITABLE;
+            if (mask == 0) continue;
+            eventLoop->fired[numevents].fd = target_fds[idx];
+            eventLoop->fired[numevents].mask = mask;
+            numevents++;
+        }
+    } else if (retval == -1 && errno != EINTR) {
+        panic("aeApiPoll: poll, %s", strerror(errno));
+    }
+    zfree(pfds);
+    zfree(target_fds);
+    return numevents;
+#else
     memcpy(&state->_rfds,&state->rfds,sizeof(fd_set));
     memcpy(&state->_wfds,&state->wfds,sizeof(fd_set));
 
@@ -83,6 +137,7 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
     }
 
     return numevents;
+#endif
 }
 
 static char *aeApiName(void) {

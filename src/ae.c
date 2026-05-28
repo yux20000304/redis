@@ -27,6 +27,12 @@
 #include "zmalloc.h"
 #include "config.h"
 
+#ifdef REDIS_GEM5_SE_SELECT
+#undef HAVE_EVPORT
+#undef HAVE_EPOLL
+#undef HAVE_KQUEUE
+#endif
+
 /* Include the best multiplexing layer supported by this system.
  * The following should be ordered by performances, descending. */
 #ifdef HAVE_EVPORT
