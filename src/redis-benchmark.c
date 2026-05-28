@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <stdint.h>
 #include <signal.h>
 #include <assert.h>
 #include <math.h>
@@ -82,6 +83,38 @@ static int cxlBenchDebugEnabled(void) {
 static int redisGem5SeDontWaitEnabled(void) {
     const char *value = getenv("REDIS_GEM5_SE_DONT_WAIT");
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int redisYcsbM5RoiEnabled(void) {
+    const char *value = getenv("REDIS_YCSB_M5_ROI");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0 &&
+           strcasecmp(value, "false") != 0 && strcasecmp(value, "no") != 0;
+}
+
+static void redisM5WorkBegin(uint64_t workid, uint64_t threadid) {
+    if (!redisYcsbM5RoiEnabled()) return;
+#if defined(__x86_64__)
+    asm volatile(".byte 0x0F, 0x04; .word 0x5a"
+                 :
+                 : "D"(workid), "S"(threadid)
+                 : "memory");
+#else
+    UNUSED(workid);
+    UNUSED(threadid);
+#endif
+}
+
+static void redisM5WorkEnd(uint64_t workid, uint64_t threadid) {
+    if (!redisYcsbM5RoiEnabled()) return;
+#if defined(__x86_64__)
+    asm volatile(".byte 0x0F, 0x04; .word 0x5b"
+                 :
+                 : "D"(workid), "S"(threadid)
+                 : "memory");
+#else
+    UNUSED(workid);
+    UNUSED(threadid);
+#endif
 }
 
 #define CXL_BENCH_DEBUGF(...) do { \
@@ -299,6 +332,8 @@ static int cxlYcsbParsePhase(const char *phase);
 static int cxlYcsbParseDistribution(const char *dist, int allow_latest);
 static int cxlYcsbParseUInt64(const char *arg, unsigned long long *out);
 static int cxlBenchmarkMain(int argc, char **argv);
+static int redisBenchmarkYcsbRoiBegin(void);
+static int redisBenchmarkYcsbRoiEnd(void);
 int showThroughput(struct aeEventLoop *eventLoop, long long id,
                    void *clientData);
 
@@ -3140,7 +3175,16 @@ static int tcpYcsbBenchmarkMain(void) {
     if (!rc && (config.ycsb_phase == CXL_YCSB_PHASE_RUN ||
                 config.ycsb_phase == CXL_YCSB_PHASE_LOAD_RUN)) {
         ctx.ycsb_next_insert_id = config.ycsb_insert_start;
-        rc |= tcpYcsbRunPhase(&ctx, 0, (int)config.ycsb_operation_count);
+        if (redisBenchmarkYcsbRoiBegin() != C_OK) {
+            rc = 1;
+        } else {
+            int run_rc = tcpYcsbRunPhase(
+                &ctx, 0, (int)config.ycsb_operation_count);
+            int end_rc = redisBenchmarkYcsbRoiEnd();
+            rc |= run_rc;
+            if (end_rc != C_OK && rc == 0)
+                rc = 1;
+        }
     }
 
     cxlBenchClose(&ctx);
@@ -3204,7 +3248,16 @@ static int cxlYcsbBenchmarkMain(void) {
     if (!rc && (config.ycsb_phase == CXL_YCSB_PHASE_RUN ||
                 config.ycsb_phase == CXL_YCSB_PHASE_LOAD_RUN)) {
         ctx.ycsb_next_insert_id = config.ycsb_insert_start;
-        rc |= cxlYcsbRunPhase(&ctx, 0, (int)config.ycsb_operation_count);
+        if (redisBenchmarkYcsbRoiBegin() != C_OK) {
+            rc = 1;
+        } else {
+            int run_rc = cxlYcsbRunPhase(
+                &ctx, 0, (int)config.ycsb_operation_count);
+            int end_rc = redisBenchmarkYcsbRoiEnd();
+            rc |= run_rc;
+            if (end_rc != C_OK && rc == 0)
+                rc = 1;
+        }
     }
 
     cxlBenchClose(&ctx);
@@ -3271,10 +3324,9 @@ static int cxlBenchmarkRunOne(const char *name, int op) {
     return failed ? 1 : 0;
 }
 
-static int redisBenchmarkTouchClientDone(int rc) {
-    if (config.gem5_client_sync_dir == NULL || config.gem5_client_id < 0)
-        return C_OK;
-
+static int redisBenchmarkEnsureSyncDir(void) {
+    if (config.gem5_client_sync_dir == NULL)
+        return C_ERR;
     char dirbuf[PATH_MAX];
     snprintf(dirbuf, sizeof(dirbuf), "%s", config.gem5_client_sync_dir);
     size_t dirlen = strlen(dirbuf);
@@ -3289,23 +3341,49 @@ static int redisBenchmarkTouchClientDone(int rc) {
     }
     if (mkdir(dirbuf, 0700) != 0 && errno != EEXIST)
         return C_ERR;
+    return C_OK;
+}
 
+static int redisBenchmarkTouchSyncFile(const char *basename,
+                                       const char *content) {
+    if (redisBenchmarkEnsureSyncDir() != C_OK)
+        return C_ERR;
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/client_%d.done",
-             config.gem5_client_sync_dir, config.gem5_client_id);
+    snprintf(path, sizeof(path), "%s/%s", config.gem5_client_sync_dir, basename);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return C_ERR;
-    char buf[64];
-    int len = snprintf(buf, sizeof(buf), "%d\n", rc);
-    if (write(fd, buf, len) != len) {
-        close(fd);
-        return C_ERR;
+    if (content != NULL) {
+        size_t len = strlen(content);
+        if (write(fd, content, len) != (ssize_t)len) {
+            close(fd);
+            return C_ERR;
+        }
     }
     close(fd);
     return C_OK;
 }
 
-static int redisBenchmarkWaitAllClients(void) {
+static int redisBenchmarkWaitSyncFile(const char *basename) {
+    if (config.gem5_client_sync_dir == NULL)
+        return C_OK;
+
+    long long deadline = ustime() +
+        (long long)config.gem5_client_sync_timeout_ms * 1000LL;
+    while (1) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", config.gem5_client_sync_dir,
+                 basename);
+        struct stat st;
+        if (stat(path, &st) == 0)
+            return C_OK;
+        if (config.gem5_client_sync_timeout_ms > 0 && ustime() >= deadline)
+            return C_ERR;
+        sched_yield();
+    }
+}
+
+static int redisBenchmarkWaitSyncPrefix(const char *prefix,
+                                        const char *suffix) {
     if (config.gem5_client_sync_dir == NULL || config.gem5_client_count <= 0)
         return C_OK;
 
@@ -3315,8 +3393,9 @@ static int redisBenchmarkWaitAllClients(void) {
         int complete = 1;
         for (int i = 0; i < config.gem5_client_count; i++) {
             char path[PATH_MAX];
-            snprintf(path, sizeof(path), "%s/client_%d.done",
-                     config.gem5_client_sync_dir, i);
+            snprintf(path, sizeof(path), "%s/%s_%d%s",
+                     config.gem5_client_sync_dir, prefix, i,
+                     suffix != NULL ? suffix : "");
             struct stat st;
             if (stat(path, &st) != 0) {
                 complete = 0;
@@ -3328,6 +3407,80 @@ static int redisBenchmarkWaitAllClients(void) {
             return C_ERR;
         sched_yield();
     }
+}
+
+static int redisBenchmarkTouchClientDone(int rc) {
+    if (config.gem5_client_sync_dir == NULL || config.gem5_client_id < 0)
+        return C_OK;
+
+    char basename[64];
+    char content[64];
+    snprintf(basename, sizeof(basename), "client_%d.done",
+             config.gem5_client_id);
+    snprintf(content, sizeof(content), "%d\n", rc);
+    return redisBenchmarkTouchSyncFile(basename, content);
+}
+
+static int redisBenchmarkWaitAllClients(void) {
+    if (config.gem5_client_sync_dir == NULL || config.gem5_client_count <= 0)
+        return C_OK;
+
+    return redisBenchmarkWaitSyncPrefix("client", ".done");
+}
+
+static int redisBenchmarkYcsbRoiSyncEnabled(void) {
+    return redisYcsbM5RoiEnabled() && config.gem5_client_sync_dir != NULL &&
+           config.gem5_client_id >= 0 && config.gem5_client_count > 0;
+}
+
+static int redisBenchmarkYcsbRoiBegin(void) {
+    if (!redisYcsbM5RoiEnabled())
+        return C_OK;
+
+    if (!redisBenchmarkYcsbRoiSyncEnabled()) {
+        redisM5WorkBegin(1, 0);
+        return C_OK;
+    }
+
+    char basename[64];
+    snprintf(basename, sizeof(basename), "roi_ready_%d",
+             config.gem5_client_id);
+    if (redisBenchmarkTouchSyncFile(basename, "") != C_OK)
+        return C_ERR;
+    if (redisBenchmarkWaitSyncPrefix("roi_ready", "") != C_OK)
+        return C_ERR;
+    if (config.gem5_client_id == 0) {
+        redisM5WorkBegin(1, 0);
+        if (redisBenchmarkTouchSyncFile("roi_begin", "") != C_OK)
+            return C_ERR;
+    }
+    return redisBenchmarkWaitSyncFile("roi_begin");
+}
+
+static int redisBenchmarkYcsbRoiEnd(void) {
+    if (!redisYcsbM5RoiEnabled())
+        return C_OK;
+
+    fflush(stdout);
+    fflush(stderr);
+    if (!redisBenchmarkYcsbRoiSyncEnabled()) {
+        redisM5WorkEnd(1, 0);
+        return C_OK;
+    }
+
+    char basename[64];
+    snprintf(basename, sizeof(basename), "roi_done_%d",
+             config.gem5_client_id);
+    if (redisBenchmarkTouchSyncFile(basename, "") != C_OK)
+        return C_ERR;
+    if (redisBenchmarkWaitSyncPrefix("roi_done", "") != C_OK)
+        return C_ERR;
+    if (config.gem5_client_id == 0) {
+        redisM5WorkEnd(1, 0);
+        if (redisBenchmarkTouchSyncFile("roi_end", "") != C_OK)
+            return C_ERR;
+    }
+    return redisBenchmarkWaitSyncFile("roi_end");
 }
 
 static void redisBenchmarkShutdownServer(void) {
